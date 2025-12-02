@@ -1108,7 +1108,7 @@ def main() -> None:
                         record_feedback(user["id"], content)
                         st.success("感谢反馈！")
                         st.session_state["sidebar_feedback_reset"] = True
-                        st.experimental_rerun()
+                        st.rerun()
                     else:
                         st.warning("请先登录后再提交建议。")
                 except Exception as exc:
