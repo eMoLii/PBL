@@ -10,6 +10,7 @@ import math
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import streamlit.components.v1 as components
 import streamlit as st
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,9 @@ from backend.database import (  # noqa: E402
     record_study_session,
     seed_users,
     verify_user,
+    create_session_token,
+    fetch_user_by_session_token,
+    delete_session_token,
 )
 from backend.services import (  # noqa: E402
     POST_TEST_ANSWERS,
@@ -64,6 +68,9 @@ SPEECH_SPEED_DESCRIPTIONS = {
     7: "第7档 · 超极速",
 }
 
+SESSION_COOKIE_NAME = "pbl_session_token"
+SESSION_COOKIE_DAYS = 30
+
 
 def _current_speed_level() -> int:
     level = int(st.session_state.get("speech_speed_level", 4))
@@ -96,6 +103,60 @@ def _ability_window_from_pre_score(pre_score: float | None) -> tuple[float, floa
     low = max(0.0, normalized - 1.0)
     high = min(5.0, normalized + 1.0)
     return (round(low, 3), round(high, 3))
+
+
+def _set_session_cookie(token: str, expires_at: datetime) -> None:
+    expires_str = expires_at.isoformat()
+    script = f"""
+    <script>
+    const expires = new Date('{expires_str}');
+    document.cookie = '{SESSION_COOKIE_NAME}=' + encodeURIComponent('{token}') + '; expires=' + expires.toUTCString() + '; path=/';
+    </script>
+    """
+    components.html(script, height=0)
+
+
+def _clear_session_cookie() -> None:
+    script = f"""
+    <script>
+    document.cookie = '{SESSION_COOKIE_NAME}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+    </script>
+    """
+    components.html(script, height=0)
+
+
+def _get_session_cookie() -> Optional[str]:
+    try:
+        headers = getattr(st.context, "headers", {}) or {}
+    except Exception:
+        headers = {}
+    cookie_header = headers.get("Cookie") or headers.get("cookie")
+    if not cookie_header:
+        return None
+    parts = cookie_header.split(";")
+    for part in parts:
+        if not part.strip():
+            continue
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        if k.strip() == SESSION_COOKIE_NAME:
+            return v.strip()
+    return None
+
+
+def _restore_user_from_cookie() -> None:
+    if st.session_state.get("user"):
+        return
+    token = _get_session_cookie()
+    if not token:
+        return
+    user = fetch_user_by_session_token(token)
+    if user:
+        st.session_state["user"] = user
+        st.session_state["session_token"] = token
+    else:
+        _clear_session_cookie()
 
 
 def _render_speed_slider() -> None:
@@ -157,6 +218,7 @@ def initialize_app_state() -> None:
         ("awaiting_teacher_after_user", False),
         ("last_teacher_seen_count", 0),
         ("desired_students_count", None),
+        ("session_token", None),
     ):
         if key not in st.session_state:
             st.session_state[key] = default
@@ -206,6 +268,19 @@ def reset_case_state() -> None:
     for key in keys:
         st.session_state.pop(key, None)
     st.session_state["desired_students_count"] = _load_default_students_count()
+
+
+def _handle_logout() -> None:
+    token = st.session_state.pop("session_token", None)
+    if token:
+        try:
+            delete_session_token(token)
+        except Exception:
+            pass
+    _clear_session_cookie()
+    st.session_state.pop("user", None)
+    reset_case_state()
+    st.session_state["page"] = "login"
 
 
 def _prepare_test_items(raw_items: List[Dict[str, Any]], fallback_kind: str, prefix: str) -> List[Dict[str, Any]]:
@@ -352,6 +427,14 @@ def render_login() -> None:
     if st.button("登录"):
         user = verify_user(username.strip(), password.strip()) if username and password else None
         if user:
+            expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_COOKIE_DAYS)
+            token = uuid.uuid4().hex
+            try:
+                create_session_token(user["id"], token, expires_at.isoformat())
+                st.session_state["session_token"] = token
+                _set_session_cookie(token, expires_at)
+            except Exception as exc:
+                st.warning(f"创建会话失败：{exc}")
             st.session_state["user"] = user
             st.session_state["page"] = "case_selection"
             st.success("登录成功！")
@@ -1052,15 +1135,16 @@ def main() -> None:
     init_db()
     seed_users(None)
     initialize_app_state()
+    _restore_user_from_cookie()
+    if st.session_state.get("user") and st.session_state.get("page") == "login":
+        st.session_state["page"] = "case_selection"
 
     with st.sidebar:
         user = st.session_state.get("user")
         if user:
             st.caption(f"当前用户：{user['username']}")
             if st.button("退出登录"):
-                st.session_state.pop("user", None)
-                reset_case_state()
-                st.session_state["page"] = "login"
+                _handle_logout()
                 st.rerun()
         else:
             st.caption("请先登录以体验 PBL 训练。")

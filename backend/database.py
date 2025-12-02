@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from datetime import datetime, timezone
+from datetime import datetime, timezone
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "pbl.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -42,6 +43,28 @@ def init_db(db_path: Optional[Path] = None) -> None:
             post_score REAL,
             evaluation_json TEXT,
             advice_json TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feedbacks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            expires_at TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """
@@ -164,5 +187,60 @@ def record_feedback(user_id: int, content: str, created_at: Optional[str] = None
         """,
         (user_id, content.strip(), timestamp),
     )
+    conn.commit()
+    conn.close()
+
+
+def create_session_token(user_id: int, token: str, expires_at: str) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    cur.execute(
+        """
+        INSERT INTO sessions (user_id, token, expires_at)
+        VALUES (?, ?, ?)
+        """,
+        (user_id, token, expires_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+def fetch_user_by_session_token(token: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT sessions.user_id, sessions.expires_at, users.username
+        FROM sessions
+        JOIN users ON users.id = sessions.user_id
+        WHERE sessions.token = ?
+        """,
+        (token,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    expires_raw = row["expires_at"]
+    try:
+        expires_at = datetime.fromisoformat(expires_raw)
+    except Exception:
+        expires_at = None
+    now = datetime.now(timezone.utc)
+    if expires_at is None:
+        return None
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < now:
+        delete_session_token(token)
+        return None
+    return {"id": row["user_id"], "username": row["username"]}
+
+
+def delete_session_token(token: str) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
     conn.commit()
     conn.close()
