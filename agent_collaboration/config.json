@@ -1,0 +1,31 @@
+{
+  "api_key": "sk-58d0fdd57ada41b5a000cd0976d92daa",
+  "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "model_name": "qwen-flash",
+  "temperature": 0.7,
+
+  "students_count": 6,
+
+  "case_id": "case_28",
+  "ability_mean_low": 3,
+  "ability_mean_high": 5,
+  "ability_sigma": 2,
+  "alpha": 2.0,
+  "beta": 2.0,
+  "gamma": 5.0,
+  "delta": 0.8,
+  "tau_d": 1.0,
+  "tau": 1.0,
+
+  "user_turn_grace_period": 10.0,
+  "debug_print_abilities": false,
+
+  "clear_memory_between_scenes": true, 
+  "max_rounds_per_scene": 60,
+  "recursion_limit": 4000000,
+
+  "evaluation_student": "Student1",
+  "evaluation_max_context_chars": 3200,
+  "activeness_sigmoid_a": 3.0,
+  "advisor_max_transcript_chars": 30000
+}
