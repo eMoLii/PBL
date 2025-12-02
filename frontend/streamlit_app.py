@@ -28,6 +28,8 @@ from backend.database import (  # noqa: E402
     create_session_token,
     fetch_user_by_session_token,
     delete_session_token,
+    get_user_profile,
+    upsert_user_profile,
 )
 from backend.services import (  # noqa: E402
     POST_TEST_ANSWERS,
@@ -70,6 +72,7 @@ SPEECH_SPEED_DESCRIPTIONS = {
 
 SESSION_COOKIE_NAME = "pbl_session_token"
 SESSION_COOKIE_DAYS = 30
+ADVANCED_OBJECTIVE_THRESHOLD = 0.5
 
 
 def _current_speed_level() -> int:
@@ -103,6 +106,48 @@ def _ability_window_from_pre_score(pre_score: float | None) -> tuple[float, floa
     low = max(0.0, normalized - 1.0)
     high = min(5.0, normalized + 1.0)
     return (round(low, 3), round(high, 3))
+
+
+def _normalize_choice_answer(value: str) -> List[str]:
+    if not isinstance(value, str):
+        return []
+    letters = re.findall(r"[A-Za-z]", value.upper())
+    seen: List[str] = []
+    for letter in letters:
+        if letter not in seen:
+            seen.append(letter)
+    return seen
+
+
+def _evaluate_question_correct(item: Dict[str, Any], response: Any) -> bool:
+    expected = _normalize_choice_answer(item.get("answer", ""))
+    if isinstance(response, list):
+        user = sorted([str(opt).upper() for opt in response])
+        return bool(expected and user and user == sorted(expected))
+    if response is None:
+        return False
+    user = _normalize_choice_answer(str(response))
+    return bool(expected and user and sorted(user) == sorted(expected))
+
+
+def _compute_scene_advanced_mask(correctness: List[bool]) -> List[bool]:
+    layout = st.session_state.get("scene_objective_keys") or []
+    mask: List[bool] = []
+    idx = 0
+    for keys in layout:
+        total = 0
+        passed = 0
+        for _ in keys:
+            if idx < len(correctness):
+                total += 1
+                if correctness[idx]:
+                    passed += 1
+            idx += 1
+        if total == 0:
+            mask.append(True)
+        else:
+            mask.append((passed / total) >= ADVANCED_OBJECTIVE_THRESHOLD)
+    return mask
 
 
 def _set_session_cookie(token: str, expires_at: datetime) -> None:
@@ -219,6 +264,10 @@ def initialize_app_state() -> None:
         ("last_teacher_seen_count", 0),
         ("desired_students_count", None),
         ("session_token", None),
+        ("user_profile_cache", None),
+        ("scene_objective_keys", []),
+        ("advanced_scene_mask", None),
+        ("pre_question_correctness", []),
     ):
         if key not in st.session_state:
             st.session_state[key] = default
@@ -264,6 +313,9 @@ def reset_case_state() -> None:
         "teacher_reply_pending",
         "awaiting_teacher_after_user",
         "last_teacher_seen_count",
+        "scene_objective_keys",
+        "advanced_scene_mask",
+        "pre_question_correctness",
     ]
     for key in keys:
         st.session_state.pop(key, None)
@@ -387,6 +439,9 @@ def start_case(case_id: str) -> None:
     st.session_state["summary_invite_scene"] = -1
     st.session_state["advice_enhanced"] = False
     st.session_state["page"] = "pre_test"
+    st.session_state["scene_objective_keys"] = case_service.scene_objective_layout(case_id)
+    st.session_state["advanced_scene_mask"] = None
+    st.session_state["pre_question_correctness"] = []
 
 
 def _fetch_session_state() -> Dict[str, Any] | None:
@@ -558,6 +613,13 @@ def render_test_page(kind: str) -> None:
         score = score_test_items(tests_to_grade, answers)
         if kind == "pre":
             st.session_state["pre_score"] = score
+            correctness = [
+                _evaluate_question_correct(item, answers.get(item.get("qid") or f"{kind}_{idx}"))
+                for idx, item in enumerate(tests_to_grade, start=1)
+            ]
+            st.session_state["pre_question_correctness"] = correctness
+            if st.session_state.get("scene_objective_keys"):
+                st.session_state["advanced_scene_mask"] = _compute_scene_advanced_mask(correctness)
             st.session_state["page"] = "pbl_training"
         else:
             st.session_state["post_score"] = score
@@ -603,6 +665,7 @@ def render_pbl_training() -> None:
                     speed_factor=speed_factor,
                     ability_window=ability_window,
                     students_count=int(st.session_state.get("desired_students_count", 5)),
+                    advanced_mask=st.session_state.get("advanced_scene_mask"),
                 )
                 st.session_state["pbl_session_id"] = session_id
                 st.session_state["speed_sync"] = {
@@ -1166,6 +1229,76 @@ def main() -> None:
             st.session_state["desired_students_count"] = new_count
         if students_locked:
             st.caption("讨论进行中，人数设置暂不可调整。")
+
+        if user:
+            profile_cache = st.session_state.get("user_profile_cache")
+            profile_reset = False
+            if not profile_cache or profile_cache.get("user_id") != user["id"]:
+                try:
+                    data = get_user_profile(user["id"]) or {}
+                except Exception as exc:
+                    st.warning(f"加载基本信息失败：{exc}")
+                    data = {}
+                profile_cache = {"user_id": user["id"], **data}
+                st.session_state["user_profile_cache"] = profile_cache
+                profile_reset = True
+            st.markdown("### 基本信息")
+            gender_options = ["未填写", "男", "女"]
+            gender_value = st.selectbox(
+                "性别",
+                gender_options,
+                index=gender_options.index((profile_cache.get("gender") or "未填写")),
+                key="profile_gender",
+            )
+            age_value = st.number_input(
+                "年龄",
+                min_value=0,
+                max_value=120,
+                step=1,
+                value=int(profile_cache.get("age") or 0),
+                key="profile_age",
+            )
+            gpa_score_value = st.number_input(
+                "GPA 分数",
+                min_value=0.0,
+                max_value=100.0,
+                step=0.1,
+                value=float(profile_cache.get("gpa_score") or 0.0),
+                key="profile_gpa_score",
+            )
+            gpa_max_value = st.number_input(
+                "GPA 满分",
+                min_value=0.0,
+                max_value=100.0,
+                step=0.1,
+                value=float(profile_cache.get("gpa_max") or 0.0),
+                key="profile_gpa_max",
+            )
+            if st.button("保存基本信息", use_container_width=True):
+                if gpa_max_value <= 0 and gpa_score_value > 0:
+                    st.warning("请先填写 GPA 满分。")
+                elif gpa_max_value > 0 and gpa_score_value > gpa_max_value:
+                    st.warning("GPA 分数不能超过满分。")
+                else:
+                    try:
+                        upsert_user_profile(
+                            user_id=user["id"],
+                            gender=gender_value if gender_value != "未填写" else None,
+                            age=int(age_value) if age_value > 0 else None,
+                            gpa_score=float(gpa_score_value) if gpa_score_value > 0 else None,
+                            gpa_max=float(gpa_max_value) if gpa_max_value > 0 else None,
+                        )
+                        st.success("已保存基本信息。")
+                        st.session_state["user_profile_cache"] = {
+                            "user_id": user["id"],
+                            "gender": gender_value if gender_value != "未填写" else None,
+                            "age": int(age_value) if age_value > 0 else None,
+                            "gpa_score": float(gpa_score_value) if gpa_score_value > 0 else None,
+                            "gpa_max": float(gpa_max_value) if gpa_max_value > 0 else None,
+                        }
+                    except Exception as exc:
+                        st.error(f"保存失败：{exc}")
+
         st.markdown("### 意见与建议")
         suggestion_disabled = user is None
         if st.session_state.pop("sidebar_feedback_reset", False):

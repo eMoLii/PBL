@@ -211,6 +211,13 @@ def sample_student_abilities_for_scene(
     return abilities_raw, abilities_desc, competence_avg
 
 
+def _is_advanced_objective_name(name: str) -> bool:
+    if not isinstance(name, str):
+        return False
+    lowered = name.lower()
+    return "进阶" in name or "advanced" in lowered
+
+
 # ------------------------- 知识图谱 RAG -------------------------
 
 class KnowledgeGraphRAG:
@@ -1419,13 +1426,42 @@ def run_one_scene(scene_index: int,
     """运行单个场景，返回本场景消息列表与 last_spoke 用于可能的跨场景延续。"""
     students = cfg["students"]
 
-    # 采样本场景能力
+    # 采样本场景能力（可根据用户水平动态移除进阶目标）
     mean_mat = cfg.get("ability_mean_matrix", [])
     assert scene_index < len(mean_mat), f"ability_mean_matrix 未提供第 {scene_index+1} 场景的均值向量"
-    sigma = cfg.get("ability_sigma", 1.0)  # 可为标量或列表（逐目标）
-    abilities_raw, abilities_desc, competence_avg = sample_student_abilities_for_scene(
-        objectives_scene, mean_mat[scene_index], sigma, students, prompts
+    full_keys = list(objectives_scene.keys())
+    mean_vec = mean_mat[scene_index]
+    assert len(full_keys) == len(mean_vec), (
+        f"场景 {scene_index+1} 的 ability_mean_matrix 维度与学习目标数不一致"
     )
+    include_advanced = True
+    mask = cfg.get("advanced_objective_mask")
+    if isinstance(mask, list) and scene_index < len(mask):
+        include_advanced = bool(mask[scene_index])
+    if include_advanced:
+        filtered_objectives = objectives_scene
+        filtered_indices = list(range(len(full_keys)))
+    else:
+        keep_keys = [k for k in full_keys if not _is_advanced_objective_name(k)]
+        if len(keep_keys) == len(full_keys) and full_keys:
+            keep_keys = full_keys[:-1]
+        filtered_objectives = {k: objectives_scene[k] for k in keep_keys}
+        filtered_indices = [full_keys.index(k) for k in keep_keys]
+    filtered_mean = [mean_vec[i] for i in filtered_indices]
+    sigma_cfg = cfg.get("ability_sigma", 1.0)
+    if isinstance(sigma_cfg, list):
+        assert len(sigma_cfg) == len(full_keys), "ability_sigma 维度需与学习目标一致"
+        sigmas = [sigma_cfg[i] for i in filtered_indices]
+    else:
+        sigmas = [float(sigma_cfg)] * len(filtered_mean)
+    abilities_raw, abilities_desc, competence_avg = sample_student_abilities_for_scene(
+        filtered_objectives,
+        filtered_mean,
+        sigmas,
+        students,
+        prompts,
+    )
+    objectives_scene = filtered_objectives
     if cfg.get("debug_print_abilities"):
         print(f"\n[Scene {scene_index + 1}/{scene_total}] 学生能力采样：")
         for stu in students:
@@ -1433,7 +1469,7 @@ def run_one_scene(scene_index: int,
             desc = abilities_desc.get(stu, {})
             summary_bits = [
                 f"{obj}={raw.get(obj, 0):.2f}"
-                for obj in objectives_scene.keys()
+                for obj in filtered_objectives.keys()
             ]
             print(
                 f"  - {stu}: "
@@ -1464,7 +1500,7 @@ def run_one_scene(scene_index: int,
         # 本场景数据
         "scene_index": scene_index,
         "case_text": case_text,
-        "objectives": objectives_scene,
+        "objectives": filtered_objectives,
         "scene_total": scene_total,
 
         # 能力（本场景）

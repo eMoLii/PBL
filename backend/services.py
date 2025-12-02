@@ -123,6 +123,18 @@ class CaseService:
             return len(scenes)
         return 1
 
+    def scene_objective_layout(self, case_id: str) -> List[List[str]]:
+        case = self.case_raw.get(case_id, {})
+        raw_objs = case.get("objectives_by_scene") or case.get("objextives") or []
+        layout: List[List[str]] = []
+        if isinstance(raw_objs, list):
+            for block in raw_objs:
+                if isinstance(block, dict):
+                    layout.append(list(block.keys()))
+                else:
+                    layout.append([])
+        return layout
+
 
 case_service = CaseService()
 
@@ -135,6 +147,7 @@ class PBLInteractiveSession:
         user_student: str = "Student1",
         ability_window: tuple[float, float] | None = None,
         students_count: int | None = None,
+        advanced_mask: List[bool] | None = None,
     ):
         self.id = uuid.uuid4().hex
         self.case_id = case_id
@@ -143,6 +156,7 @@ class PBLInteractiveSession:
         self.speed_factor = 1.0
         self.ability_window = ability_window
         self.students_count = students_count
+        self.advanced_mask = advanced_mask
         self.user_student = user_student
         self.queue: "queue.Queue[str]" = queue.Queue()
         self.user_turn_event = threading.Event()
@@ -189,6 +203,11 @@ class PBLInteractiveSession:
                     **(
                         {"students_count": int(self.students_count)}
                         if self.students_count is not None
+                        else {}
+                    ),
+                    **(
+                        {"advanced_objective_mask": self.advanced_mask}
+                        if self.advanced_mask is not None
                         else {}
                     ),
                 },
@@ -365,12 +384,14 @@ class PBLSessionManager:
         speed_factor: float = 1.0,
         ability_window: tuple[float, float] | None = None,
         students_count: int | None = None,
+        advanced_mask: List[bool] | None = None,
     ) -> str:
         session = PBLInteractiveSession(
             case_id,
             interval=self.pause_interval,
             ability_window=ability_window,
             students_count=students_count,
+            advanced_mask=advanced_mask,
         )
         if speed_factor != 1.0:
             session.set_speed_factor(speed_factor)
@@ -440,12 +461,14 @@ def start_interactive_session(
     speed_factor: float = 1.0,
     ability_window: tuple[float, float] | None = None,
     students_count: int | None = None,
+    advanced_mask: List[bool] | None = None,
 ) -> str:
     return _SESSION_MANAGER.create_session(
         case_id,
         speed_factor=speed_factor,
         ability_window=ability_window,
         students_count=students_count,
+        advanced_mask=advanced_mask,
     )
 
 

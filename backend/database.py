@@ -80,6 +80,18 @@ def init_db(db_path: Optional[Path] = None) -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id INTEGER PRIMARY KEY,
+            gender TEXT,
+            age INTEGER,
+            gpa_score REAL,
+            gpa_max REAL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -242,5 +254,49 @@ def delete_session_token(token: str) -> None:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+
+
+def get_user_profile(user_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT gender, age, gpa_score, gpa_max FROM user_profiles WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "gender": row["gender"],
+        "age": row["age"],
+        "gpa_score": row["gpa_score"],
+        "gpa_max": row["gpa_max"],
+    }
+
+
+def upsert_user_profile(
+    user_id: int,
+    gender: Optional[str],
+    age: Optional[int],
+    gpa_score: Optional[float],
+    gpa_max: Optional[float],
+) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO user_profiles (user_id, gender, age, gpa_score, gpa_max)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            gender=excluded.gender,
+            age=excluded.age,
+            gpa_score=excluded.gpa_score,
+            gpa_max=excluded.gpa_max
+        """,
+        (user_id, gender, age, gpa_score, gpa_max),
+    )
     conn.commit()
     conn.close()
