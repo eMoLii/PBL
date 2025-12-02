@@ -1084,8 +1084,11 @@ def main() -> None:
             st.caption("讨论进行中，人数设置暂不可调整。")
         st.markdown("### 意见与建议")
         suggestion_disabled = user is None
+        if st.session_state.pop("sidebar_feedback_reset", False):
+            st.session_state["sidebar_feedback_text"] = ""
         suggestion = st.text_area(
             "欢迎随时提出改进建议",
+            value=st.session_state.get("sidebar_feedback_text", ""),
             key="sidebar_feedback_text",
             height=120,
             disabled=suggestion_disabled,
@@ -1104,7 +1107,7 @@ def main() -> None:
                     if user:
                         record_feedback(user["id"], content)
                         st.success("感谢反馈！")
-                        st.session_state["sidebar_feedback_text"] = ""
+                        st.session_state["sidebar_feedback_reset"] = True
                         st.experimental_rerun()
                     else:
                         st.warning("请先登录后再提交建议。")
