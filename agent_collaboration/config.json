@@ -17,7 +17,7 @@
   "tau_d": 1.0,
   "tau": 1.0,
 
-  "user_turn_grace_period": 10.0,
+  "user_turn_grace_period": 26.0,
   "debug_print_abilities": false,
 
   "clear_memory_between_scenes": true, 
@@ -27,5 +27,6 @@
   "evaluation_student": "Student1",
   "evaluation_max_context_chars": 3200,
   "activeness_sigmoid_a": 3.0,
-  "advisor_max_transcript_chars": 30000
+  "advisor_max_transcript_chars": 30000,
+  "session_timeout_minutes": 0.01
 }

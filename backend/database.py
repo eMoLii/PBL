@@ -86,8 +86,18 @@ def init_db(db_path: Optional[Path] = None) -> None:
             user_id INTEGER PRIMARY KEY,
             gender TEXT,
             age INTEGER,
-            gpa_score REAL,
-            gpa_max REAL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS active_sessions (
+            user_id INTEGER PRIMARY KEY,
+            case_id TEXT NOT NULL,
+            session_id TEXT,
+            metadata_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """
@@ -258,11 +268,65 @@ def delete_session_token(token: str) -> None:
     conn.close()
 
 
+def save_active_session_state(
+    user_id: int,
+    case_id: str,
+    session_id: str,
+    metadata: Dict[str, Any],
+) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    payload = json.dumps(metadata, ensure_ascii=False)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    cur.execute(
+        """
+        INSERT INTO active_sessions (user_id, case_id, session_id, metadata_json, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            case_id=excluded.case_id,
+            session_id=excluded.session_id,
+            metadata_json=excluded.metadata_json,
+            updated_at=excluded.updated_at
+        """,
+        (user_id, case_id, session_id, payload, timestamp),
+    )
+    conn.commit()
+    conn.close()
+
+
+def fetch_active_session_state(user_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT case_id, session_id, metadata_json, updated_at FROM active_sessions WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
+    return {
+        "case_id": row["case_id"],
+        "session_id": row["session_id"],
+        "metadata": metadata,
+        "updated_at": row["updated_at"],
+    }
+
+
+def clear_active_session_state(user_id: int) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM active_sessions WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
 def get_user_profile(user_id: int) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT gender, age, gpa_score, gpa_max FROM user_profiles WHERE user_id = ?",
+        "SELECT gender, age FROM user_profiles WHERE user_id = ?",
         (user_id,),
     )
     row = cur.fetchone()
@@ -272,8 +336,6 @@ def get_user_profile(user_id: int) -> Optional[Dict[str, Any]]:
     return {
         "gender": row["gender"],
         "age": row["age"],
-        "gpa_score": row["gpa_score"],
-        "gpa_max": row["gpa_max"],
     }
 
 
@@ -281,22 +343,18 @@ def upsert_user_profile(
     user_id: int,
     gender: Optional[str],
     age: Optional[int],
-    gpa_score: Optional[float],
-    gpa_max: Optional[float],
 ) -> None:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO user_profiles (user_id, gender, age, gpa_score, gpa_max)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO user_profiles (user_id, gender, age)
+        VALUES (?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             gender=excluded.gender,
-            age=excluded.age,
-            gpa_score=excluded.gpa_score,
-            gpa_max=excluded.gpa_max
+            age=excluded.age
         """,
-        (user_id, gender, age, gpa_score, gpa_max),
+        (user_id, gender, age),
     )
     conn.commit()
     conn.close()

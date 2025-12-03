@@ -11,6 +11,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 import queue
+import logging
+import gc
 
 import numpy as np
 
@@ -19,11 +21,32 @@ from agent_collaboration.sequential_recommender import (
     SequentialAdaptiveRecommender,
     load_case_ids,
 )
+from backend.database import (
+    record_study_session,
+    save_active_session_state,
+    fetch_active_session_state,
+    clear_active_session_state,
+)
+
+logger = logging.getLogger("pbl.backend")
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
+# Suppress verbose HTTP client logs (e.g., httpx request lines).
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 CASE_PATH = BASE_DIR / "agent_collaboration" / "data" / "case.json"
 MATRIX_PATH = BASE_DIR / "agent_collaboration" / "data" / "case_similarity_matrix.npy"
 CONFIG_PATH = BASE_DIR / "agent_collaboration" / "config.json"
+
+
+def _load_session_timeout_minutes() -> float:
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return float(cfg.get("session_timeout_minutes", 30.0))
+    except Exception:
+        return 30.0
 
 
 @dataclass
@@ -40,12 +63,21 @@ class CaseService:
             self.case_raw = json.load(f)
         self.case_ids = sorted(self.case_raw.keys())
         self.recommender: SequentialAdaptiveRecommender | None = None
+        self.departments = self._extract_departments()
         if MATRIX_PATH.exists():
             matrix = np.load(MATRIX_PATH)
             case_ids_sorted = load_case_ids(CASE_PATH)
             # 仅当矩阵与case_id长度匹配时启用推荐
             if matrix.shape[0] == len(case_ids_sorted):
                 self.recommender = SequentialAdaptiveRecommender(matrix, case_ids_sorted)
+
+    def _extract_departments(self) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for cid, payload in self.case_raw.items():
+            dept = payload.get("department") or payload.get("科室")
+            if isinstance(dept, str) and dept.strip():
+                mapping[cid] = dept.strip()
+        return mapping
 
     def list_cases(self) -> List[CaseBrief]:
         return [self.to_brief(case_id) for case_id in self.case_ids]
@@ -64,9 +96,14 @@ class CaseService:
             objectives.append("综合诊断与管理")
         return CaseBrief(case_id=case_id, title=title.strip(), summary=summary.strip(), objectives=objectives)
 
-    def recommend(self, history: Sequence[Dict[str, Any]], top_k: int = 3) -> List[CaseBrief]:
-        if not history or not self.recommender:
-            return [self.to_brief(cid) for cid in self.case_ids[:top_k]]
+    def recommend(self, history: Sequence[Dict[str, Any]], top_k: int = 3, *, department_filter: str | None = None) -> List[CaseBrief]:
+        dept_clean = (department_filter or "").strip()
+        if (not history) or (not self.recommender):
+            eligible = [cid for cid in self.case_ids if not dept_clean or self.departments.get(cid) == dept_clean]
+            if not eligible:
+                eligible = list(self.case_ids)
+            selected = eligible[:top_k]
+            return [self.to_brief(cid) for cid in selected]
         hist_ids = []
         scores = []
         for item in history:
@@ -77,10 +114,26 @@ class CaseService:
             score = item.get("post_score") or item.get("pre_score") or 60.0
             scores.append(max(0.0, min(5.0, float(score) / 20.0)))
         if not hist_ids:
-            return [self.to_brief(cid) for cid in self.case_ids[:top_k]]
+            eligible = [cid for cid in self.case_ids if not dept_clean or self.departments.get(cid) == dept_clean]
+            if not eligible:
+                eligible = list(self.case_ids)
+            return [self.to_brief(cid) for cid in eligible[:top_k]]
         try:
             recs = self.recommender.recommend(hist_ids, scores, top_k=top_k)
-            return [self.to_brief(rec.case_id) for rec in recs]
+            final = []
+            for rec in recs:
+                if dept_clean and self.departments.get(rec.case_id) != dept_clean:
+                    continue
+                final.append(self.to_brief(rec.case_id))
+                if len(final) >= top_k:
+                    break
+            if len(final) < top_k:
+                remaining = [cid for cid in self.case_ids if (not dept_clean or self.departments.get(cid) == dept_clean) and cid not in hist_ids]
+                for cid in remaining:
+                    final.append(self.to_brief(cid))
+                    if len(final) >= top_k:
+                        break
+            return final
         except Exception:
             return [self.to_brief(cid) for cid in self.case_ids[:top_k]]
 
@@ -144,23 +197,33 @@ class PBLInteractiveSession:
         self,
         case_id: str,
         interval: float = 12.0,
+        owner_user_id: int | None = None,
+        owner_username: str | None = None,
         user_student: str = "Student1",
         ability_window: tuple[float, float] | None = None,
         students_count: int | None = None,
         advanced_mask: List[bool] | None = None,
+        start_scene_index: int = 0,
+        prefill_log: List[Dict[str, Any]] | None = None,
+        prefill_stats: Dict[str, Any] | None = None,
     ):
         self.id = uuid.uuid4().hex
         self.case_id = case_id
         self.base_interval = max(0.0, float(interval))
         self.interval = self.base_interval
+        self.owner_user_id = owner_user_id
+        self.owner_username = owner_username
         self.speed_factor = 1.0
         self.ability_window = ability_window
         self.students_count = students_count
         self.advanced_mask = advanced_mask
+        self.prefill_log = list(prefill_log or [])
+        self.prefill_stats = dict(prefill_stats or {})
+        self.start_scene_index = max(0, int(start_scene_index))
         self.user_student = user_student
         self.queue: "queue.Queue[str]" = queue.Queue()
         self.user_turn_event = threading.Event()
-        self.log: List[Dict[str, Any]] = []
+        self.log: List[Dict[str, Any]] = list(self.prefill_log)
         self.status = "init"
         self.waiting_for_user = False
         self.error = ""
@@ -174,14 +237,36 @@ class PBLInteractiveSession:
         self.freeze_log_index: int | None = None
         self.cfg_snapshot: Dict[str, Any] | None = None
         self.prompts_snapshot: Dict[str, Any] | None = None
+        self.last_active = time.time()
+        self.user_last_heartbeat = time.time()
+        self.stop_event = threading.Event()
+        self.stop_requested = False
 
     def start(self) -> None:
         self.status = "running"
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+    def touch(self) -> None:
+        self.last_active = time.time()
+
+    def heartbeat(self) -> None:
+        with self.state_lock:
+            self.user_last_heartbeat = time.time()
+
+    def is_finished(self) -> bool:
+        return self.status in {"completed", "error", "stopped"}
+
+    def is_expired(self, now: float, timeout: float) -> bool:
+        if timeout <= 0 or self.is_finished():
+            return False
+        return (now - self.user_last_heartbeat) >= timeout
+
     def _run(self) -> None:
         try:
+            if self.stop_requested:
+                self.status = "stopped"
+                return
             result = pbl_engine.run_pbl_workflow(
                 case_id=self.case_id,
                 config_overrides={
@@ -191,6 +276,7 @@ class PBLInteractiveSession:
                     "user_waiting_callback": self._on_waiting_flag,
                     "user_student_name": self.user_student,
                     "user_turn_grace_period": self.interval,
+                    "stop_event": self.stop_event,
                     "show_console": False,
                     **(
                         {
@@ -212,6 +298,9 @@ class PBLInteractiveSession:
                     ),
                 },
                 display=False,
+                start_scene_index=self.start_scene_index,
+                prefill_log=list(self.prefill_log),
+                prefill_stats=dict(self.prefill_stats),
             )
             self.evaluation = result.get("evaluation")
             self.advice = result.get("advice")
@@ -219,18 +308,19 @@ class PBLInteractiveSession:
             self.cfg_snapshot = result.get("cfg")
             self.prompts_snapshot = result.get("prompts")
             if self.evaluation is not None:
-                print(
-                    "[PBL] EvaluationAgent output:\n"
-                    f"{json.dumps(self.evaluation, ensure_ascii=False, indent=2)}",
-                    flush=True,
+                logger.info(
+                    "[PBL] EvaluationAgent output:\n%s",
+                    json.dumps(self.evaluation, ensure_ascii=False, indent=2),
                 )
             if self.advice is not None:
-                print(
-                    "[PBL] AdvisorAgent output:\n"
-                    f"{json.dumps(self.advice, ensure_ascii=False, indent=2)}",
-                    flush=True,
+                logger.info(
+                    "[PBL] AdvisorAgent output:\n%s",
+                    json.dumps(self.advice, ensure_ascii=False, indent=2),
                 )
             self.status = "completed"
+        except pbl_engine.StopRequested:
+            self.status = "stopped"
+            self.error = "stopped"
         except Exception as exc:
             self.error = str(exc)
             self.status = "error"
@@ -262,16 +352,18 @@ class PBLInteractiveSession:
         with self.state_lock:
             self.advice = advice
         if advice is not None:
-            print(
-                "[PBL] AdvisorAgent (with tests) output:\n"
-                f"{json.dumps(advice, ensure_ascii=False, indent=2)}",
-                flush=True,
+            logger.info(
+                "[PBL] AdvisorAgent (with tests) output:\n%s",
+                json.dumps(advice, ensure_ascii=False, indent=2),
             )
+        self.touch()
         return advice
 
     def _on_message(self, payload: Dict[str, Any]) -> None:
         speaker = payload.get("speaker")
         with self.state_lock:
+            if self.stop_requested:
+                raise RuntimeError("session stopped")
             drop = False
             freeze = self.freeze_log_index
             is_teacher = bool(speaker and str(speaker).lower() == "teacher")
@@ -294,15 +386,19 @@ class PBLInteractiveSession:
                 self.suppress_non_user_messages = False
                 self.freeze_log_index = None
             log_len = len(self.log)
-        print(
-            f"[hook] {time.strftime('%H:%M:%S')} speaker={speaker} "
-            f"drop={drop} len_before={log_len} freeze={freeze} suppress={self.suppress_non_user_messages}",
-            flush=True,
+        logger.info(
+            "[hook %s] speaker=%s drop=%s len_before=%s freeze=%s suppress=%s",
+            time.strftime('%H:%M:%S'),
+            speaker,
+            drop,
+            log_len,
+            freeze,
+            self.suppress_non_user_messages,
         )
         if speaker:
             try:
                 content = payload.get("content") or ""
-                print(f"[dialogue] {speaker}: {content}\n\n", flush=True)
+                logger.debug("[dialogue] %s: %s", speaker, content)
             except Exception:
                 pass
         if drop:
@@ -318,10 +414,12 @@ class PBLInteractiveSession:
                     time.sleep(wait)
                 self.last_emit_time = time.time()
         self.log.append(payload)
+        self.touch()
 
     def _on_waiting_flag(self, flag: bool) -> None:
         with self.state_lock:
             self.waiting_for_user = flag or self.user_turn_event.is_set()
+        self.touch()
 
     def set_speed_factor(self, factor: float) -> None:
         factor = float(factor)
@@ -332,6 +430,7 @@ class PBLInteractiveSession:
             # 防止出现过小的等待时间导致线程忙等
             adjusted = self.base_interval * factor
             self.interval = max(0.05, adjusted)
+        self.touch()
 
     def _activate_user_turn_locked(self) -> None:
         self.user_turn_event.set()
@@ -345,6 +444,7 @@ class PBLInteractiveSession:
             self.waiting_for_user = False
             self.suppress_non_user_messages = False
             self.freeze_log_index = None
+        self.touch()
 
     def request_turn(self) -> None:
         with self.state_lock:
@@ -358,6 +458,7 @@ class PBLInteractiveSession:
             self.waiting_for_user = False
             self.suppress_non_user_messages = False
             self.freeze_log_index = None
+        self.touch()
 
     def serialize(self) -> Dict[str, Any]:
         return {
@@ -371,27 +472,100 @@ class PBLInteractiveSession:
             "student_stats": self.student_stats,
         }
 
+    def stop(self) -> None:
+        with self.state_lock:
+            self.stop_requested = True
+            self.stop_event.set()
+            self.user_turn_event.set()
+
 
 class PBLSessionManager:
-    def __init__(self, pause_interval: float = 12.0):
+    def __init__(self, pause_interval: float = 12.0, session_timeout_minutes: float = 30.0):
         self.sessions: Dict[str, PBLInteractiveSession] = {}
         self.lock = threading.Lock()
         self.pause_interval = pause_interval
+        self.session_timeout = max(60.0, float(session_timeout_minutes) * 60.0)
+        self._stop_cleaner = threading.Event()
+        self._cleaner_thread = threading.Thread(target=self._cleaner_loop, daemon=True)
+        self._cleaner_thread.start()
+
+    def _cleaner_loop(self) -> None:
+        while not self._stop_cleaner.is_set():
+            try:
+                self._cleanup_expired_sessions()
+            except Exception as exc:
+                logger.warning("[SessionManager] Cleaner loop error: %s", exc)
+            self._stop_cleaner.wait(10.0)
+
+    def _cleanup_expired_sessions(self) -> None:
+        now = time.time()
+        with self.lock:
+            removed: List[tuple[str, PBLInteractiveSession]] = []
+            for sid, session in list(self.sessions.items()):
+                expired = session.is_expired(now, self.session_timeout)
+                if expired and not session.is_finished():
+                    logger.info(
+                        "[SessionManager] Heartbeat lost for session %s (owner=%s), requesting stop.",
+                        sid,
+                        session.owner_username or session.owner_user_id or "unknown",
+                    )
+                    session.stop()
+                if session.is_finished() or expired:
+                    removed.append((sid, session))
+            for sid, _ in removed:
+                self.sessions.pop(sid, None)
+            remaining_info = [
+                f"{sid}({session.owner_username or session.owner_user_id or 'unknown'})"
+                for sid, session in self.sessions.items()
+            ]
+            if removed:
+                detail_bits = []
+                for sid, session in removed:
+                    owner = session.owner_username or session.owner_user_id or "unknown"
+                    detail_bits.append(f"{sid}({owner})")
+                    # release large buffers before GC
+                    session.log.clear()
+                    session.prefill_log.clear()
+                    session.prefill_stats.clear()
+                    session.queue = queue.Queue()
+                logger.info(
+                    "[SessionManager] Cleaned %d session(s): %s. Remaining: %s",
+                    len(removed),
+                    detail_bits,
+                    remaining_info,
+                )
+                gc.collect()
+            else:
+                logger.debug(
+                    "[SessionManager] Current sessions: %s",
+                    remaining_info,
+                )
 
     def create_session(
         self,
         case_id: str,
         speed_factor: float = 1.0,
+        owner_user_id: int | None = None,
+        owner_username: str | None = None,
         ability_window: tuple[float, float] | None = None,
         students_count: int | None = None,
         advanced_mask: List[bool] | None = None,
+        start_scene_index: int = 0,
+        prefill_log: List[Dict[str, Any]] | None = None,
+        prefill_stats: Dict[str, Any] | None = None,
     ) -> str:
+        self._cleanup_expired_sessions()
         session = PBLInteractiveSession(
             case_id,
             interval=self.pause_interval,
+            owner_user_id=owner_user_id,
+            owner_username=owner_username,
             ability_window=ability_window,
             students_count=students_count,
             advanced_mask=advanced_mask,
+            start_scene_index=start_scene_index,
+            prefill_log=prefill_log,
+            prefill_stats=prefill_stats,
         )
         if speed_factor != 1.0:
             session.set_speed_factor(speed_factor)
@@ -401,24 +575,36 @@ class PBLSessionManager:
         return session.id
 
     def get_state(self, session_id: str) -> Dict[str, Any]:
+        self._cleanup_expired_sessions()
         session = self.sessions.get(session_id)
         if not session:
             return {"status": "not_found"}
+        session.touch()
         return session.serialize()
 
     def submit_message(self, session_id: str, text: str) -> None:
+        self._cleanup_expired_sessions()
         session = self.sessions.get(session_id)
         if not session:
             raise KeyError("session not found")
         session.submit_user_message(text)
 
     def resume(self, session_id: str) -> None:
+        self._cleanup_expired_sessions()
         session = self.sessions.get(session_id)
         if not session:
             raise KeyError("session not found")
         session.resume_discussion()
 
+    def heartbeat(self, session_id: str) -> None:
+        self._cleanup_expired_sessions()
+        session = self.sessions.get(session_id)
+        if not session:
+            raise KeyError("session not found")
+        session.heartbeat()
+
     def set_speed_factor(self, session_id: str, factor: float) -> None:
+        self._cleanup_expired_sessions()
         session = self.sessions.get(session_id)
         if not session:
             raise KeyError("session not found")
@@ -431,6 +617,7 @@ class PBLSessionManager:
         post_score: float,
         test_report: str | None = None,
     ) -> Dict[str, Any] | None:
+        self._cleanup_expired_sessions()
         session = self.sessions.get(session_id)
         if not session:
             raise KeyError("session not found")
@@ -446,7 +633,10 @@ def _load_pause_interval() -> float:
         return 12.0
 
 
-_SESSION_MANAGER = PBLSessionManager(pause_interval=_load_pause_interval())
+_SESSION_MANAGER = PBLSessionManager(
+    pause_interval=_load_pause_interval(),
+    session_timeout_minutes=_load_session_timeout_minutes(),
+)
 
 
 def run_agent_workflow(case_id: str, cfg_overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -459,16 +649,26 @@ def run_agent_workflow(case_id: str, cfg_overrides: Dict[str, Any] | None = None
 def start_interactive_session(
     case_id: str,
     speed_factor: float = 1.0,
+    owner_user_id: int | None = None,
+    owner_username: str | None = None,
     ability_window: tuple[float, float] | None = None,
     students_count: int | None = None,
     advanced_mask: List[bool] | None = None,
+    start_scene_index: int = 0,
+    prefill_log: List[Dict[str, Any]] | None = None,
+    prefill_stats: Dict[str, Any] | None = None,
 ) -> str:
     return _SESSION_MANAGER.create_session(
         case_id,
         speed_factor=speed_factor,
+        owner_user_id=owner_user_id,
+        owner_username=owner_username,
         ability_window=ability_window,
         students_count=students_count,
         advanced_mask=advanced_mask,
+        start_scene_index=start_scene_index,
+        prefill_log=prefill_log,
+        prefill_stats=prefill_stats,
     )
 
 
@@ -491,6 +691,10 @@ def resume_user_turn(session_id: str) -> None:
     _SESSION_MANAGER.resume(session_id)
 
 
+def heartbeat_session(session_id: str) -> None:
+    _SESSION_MANAGER.heartbeat(session_id)
+
+
 def set_session_speed(session_id: str, speed_factor: float) -> None:
     _SESSION_MANAGER.set_speed_factor(session_id, speed_factor)
 
@@ -502,6 +706,23 @@ def refresh_advice_with_tests(
     test_report: str | None = None,
 ) -> Dict[str, Any] | None:
     return _SESSION_MANAGER.refresh_advice(session_id, pre_score, post_score, test_report)
+
+
+def save_active_session_for_user(
+    user_id: int,
+    case_id: str,
+    session_id: str,
+    metadata: Dict[str, Any],
+) -> None:
+    save_active_session_state(user_id, case_id, session_id, metadata)
+
+
+def load_active_session_for_user(user_id: int) -> Dict[str, Any] | None:
+    return fetch_active_session_state(user_id)
+
+
+def clear_active_session_for_user(user_id: int) -> None:
+    clear_active_session_state(user_id)
 
 
 PRE_TEST_QUESTIONS = [

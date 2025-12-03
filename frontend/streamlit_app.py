@@ -46,6 +46,10 @@ from backend.services import (  # noqa: E402
     set_session_speed,
     refresh_advice_with_tests,
     score_test_items,
+    save_active_session_for_user,
+    load_active_session_for_user,
+    clear_active_session_for_user,
+    heartbeat_session,
 )
 
 OBJ_TAG_PATTERN = re.compile(r"<\s*OBJ\s*:\s*(.+?)>")
@@ -150,6 +154,174 @@ def _compute_scene_advanced_mask(correctness: List[bool]) -> List[bool]:
     return mask
 
 
+def _compute_student_stats(log: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    stats: Dict[str, Dict[str, float]] = {}
+    for entry in log:
+        speaker = entry.get("speaker")
+        if not speaker:
+            continue
+        content = entry.get("content") or ""
+        slot = stats.setdefault(speaker, {"message_count": 0.0, "char_count": 0.0})
+        slot["message_count"] += 1.0
+        slot["char_count"] += float(len(str(content)))
+    return stats
+
+
+def _build_active_session_metadata(next_scene_index: Optional[int] = None) -> Dict[str, Any]:
+    log = st.session_state.get("pbl_log", [])
+    if next_scene_index is None:
+        next_scene_index = st.session_state.get("next_scene_index", 0)
+    return {
+        "log": log,
+        "pre_answers": st.session_state.get("pre_answers", {}),
+        "pre_score": st.session_state.get("pre_score"),
+        "pre_question_correctness": st.session_state.get("pre_question_correctness", []),
+        "scene_objective_keys": st.session_state.get("scene_objective_keys"),
+        "advanced_scene_mask": st.session_state.get("advanced_scene_mask"),
+        "desired_students_count": st.session_state.get("desired_students_count"),
+        "next_scene_index": int(next_scene_index or 0),
+        "total_scenes": st.session_state.get("total_scenes"),
+        "student_stats": _compute_student_stats(log),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _save_active_session_state(force: bool = False, next_scene_index: Optional[int] = None) -> None:
+    user = st.session_state.get("user")
+    session_id = st.session_state.get("pbl_session_id")
+    case_id = st.session_state.get("selected_case_id")
+    if not (user and session_id and case_id):
+        return
+    total_scenes = st.session_state.get("total_scenes") or len(st.session_state.get("scene_objective_keys") or [])
+    if next_scene_index is None:
+        next_scene_index = st.session_state.get("next_scene_index", 0)
+    if total_scenes and next_scene_index >= total_scenes:
+        return
+    log = st.session_state.get("pbl_log", [])
+    last_len = st.session_state.get("last_saved_log_len", 0)
+    if not force and len(log) == last_len:
+        return
+    metadata = _build_active_session_metadata(next_scene_index=next_scene_index)
+    try:
+        save_active_session_for_user(user["id"], case_id, session_id, metadata)
+        st.session_state["last_saved_log_len"] = len(log)
+    except Exception as exc:
+        if force:
+            st.warning(f"保存讨论进度失败：{exc}")
+
+
+def _clear_active_session_record() -> None:
+    user = st.session_state.get("user")
+    if user:
+        try:
+            clear_active_session_for_user(user["id"])
+        except Exception:
+            pass
+    st.session_state["pending_active_session"] = None
+    st.session_state["last_saved_log_len"] = 0
+    st.session_state["last_saved_scene_index"] = -1
+    st.session_state["next_scene_index"] = 0
+    st.session_state["session_lost"] = False
+    st.session_state["pending_tab_click"] = None
+
+
+def _load_active_session_record() -> None:
+    user = st.session_state.get("user")
+    if not user or st.session_state.get("active_session_checked"):
+        return
+    st.session_state["active_session_checked"] = True
+    try:
+        data = load_active_session_for_user(user["id"])
+    except Exception as exc:
+        st.warning(f"加载未完成讨论失败：{exc}")
+        data = None
+    if data:
+        metadata = data.get("metadata") or {}
+        total = metadata.get("total_scenes")
+        next_idx = metadata.get("next_scene_index")
+        if isinstance(total, int) and isinstance(next_idx, int) and next_idx >= total:
+            try:
+                clear_active_session_for_user(user["id"])
+            except Exception:
+                pass
+            data = None
+    st.session_state["pending_active_session"] = data
+
+
+def _resume_saved_session(entry: Dict[str, Any]) -> None:
+    case_id = entry.get("case_id")
+    metadata = entry.get("metadata") or {}
+    if not case_id:
+        st.warning("保存的讨论记录已失效。")
+        _clear_active_session_record()
+        return
+    next_scene_index = int(metadata.get("next_scene_index", 0))
+    _clear_active_session_record()
+    st.session_state["selected_case_id"] = case_id
+    st.session_state["case_brief"] = case_service.to_brief(case_id)
+    tests = case_service.fetch_tests(case_id)
+    st.session_state["pre_test_items"] = _prepare_test_items(tests["pre"], "pre", "pre")
+    st.session_state["post_test_items"] = _prepare_test_items(tests["post"], "post", "post")
+    st.session_state["total_scenes"] = case_service.scene_count(case_id)
+    st.session_state["scene_objective_keys"] = metadata.get("scene_objective_keys") or case_service.scene_objective_layout(case_id)
+    st.session_state["advanced_scene_mask"] = metadata.get("advanced_scene_mask")
+    st.session_state["pre_answers"] = metadata.get("pre_answers", {})
+    st.session_state["pre_score"] = metadata.get("pre_score")
+    st.session_state["pre_question_correctness"] = metadata.get("pre_question_correctness", [])
+    st.session_state["desired_students_count"] = metadata.get("desired_students_count", st.session_state.get("desired_students_count"))
+    prefill_log = metadata.get("log", [])
+    st.session_state["pbl_log"] = list(prefill_log)
+    total_scenes = st.session_state.get("total_scenes") or len(st.session_state.get("scene_objective_keys") or [])
+    if total_scenes and next_scene_index >= total_scenes:
+        st.info("该讨论已完成，无法继续。")
+        _clear_active_session_record()
+        st.session_state["page"] = "case_selection"
+        st.rerun()
+        st.stop()
+    ability_window = _ability_window_from_pre_score(st.session_state.get("pre_score"))
+    speed_factor = _current_speed_factor()
+    students_count = metadata.get("desired_students_count", st.session_state.get("desired_students_count"))
+    current_user = st.session_state.get("user") or {}
+    session_id = start_interactive_session(
+        case_id,
+        speed_factor=speed_factor,
+        owner_user_id=current_user.get("id"),
+        owner_username=current_user.get("username"),
+        ability_window=ability_window,
+        students_count=int(students_count) if students_count else None,
+        advanced_mask=metadata.get("advanced_scene_mask"),
+        start_scene_index=next_scene_index,
+        prefill_log=prefill_log,
+        prefill_stats=metadata.get("student_stats"),
+    )
+    st.session_state["pbl_session_id"] = session_id
+    st.session_state["speed_sync"] = {
+        "session_id": session_id,
+        "level": _current_speed_level(),
+    }
+    st.session_state["pending_active_session"] = None
+    st.session_state["last_saved_log_len"] = len(prefill_log)
+    st.session_state["last_saved_scene_index"] = next_scene_index - 1
+    st.session_state["next_scene_index"] = next_scene_index
+    st.session_state["page"] = "pbl_training"
+    st.session_state["session_lost"] = False
+    st.session_state["scroll_to_top_on_train"] = True
+    total_scenes = st.session_state.get("total_scenes") or len(st.session_state.get("scene_objective_keys") or [])
+    target_index = min(max(next_scene_index, 0), max(total_scenes - 1, 0))
+    st.session_state["pending_tab_click"] = target_index
+    st.session_state["session_saved"] = False
+    st.session_state["teacher_reply_pending"] = False
+    st.session_state["awaiting_teacher_after_user"] = False
+    st.session_state["allow_user_input"] = False
+    st.session_state["manual_pause_active"] = True
+    st.session_state["scene_transition_ready_at"] = 0.0
+    st.session_state["scene_transition_waiting"] = False
+    st.session_state["last_transition_scene"] = next_scene_index - 1
+    _save_active_session_state(force=True, next_scene_index=next_scene_index)
+    st.rerun()
+    st.stop()
+
+
 def _set_session_cookie(token: str, expires_at: datetime) -> None:
     expires_str = expires_at.isoformat()
     script = f"""
@@ -219,6 +391,12 @@ def _render_speed_slider() -> None:
     st.caption(desc)
 
 
+def _clear_page_container(key: str) -> None:
+    placeholder = st.session_state.pop(key, None)
+    if placeholder is not None:
+        placeholder.empty()
+
+
 def _sync_speed_to_session(session_id: Optional[str]) -> None:
     if not session_id:
         st.session_state.pop("speed_sync", None)
@@ -268,6 +446,14 @@ def initialize_app_state() -> None:
         ("scene_objective_keys", []),
         ("advanced_scene_mask", None),
         ("pre_question_correctness", []),
+        ("pending_active_session", None),
+        ("active_session_checked", False),
+        ("last_saved_log_len", 0),
+        ("next_scene_index", 0),
+        ("last_saved_scene_index", -1),
+        ("session_lost", False),
+        ("scroll_to_top_on_train", False),
+        ("pending_tab_click", None),
     ):
         if key not in st.session_state:
             st.session_state[key] = default
@@ -316,10 +502,21 @@ def reset_case_state() -> None:
         "scene_objective_keys",
         "advanced_scene_mask",
         "pre_question_correctness",
+        "pending_active_session",
+        "active_session_checked",
+        "last_saved_log_len",
+        "next_scene_index",
+        "last_saved_scene_index",
+        "session_lost",
+        "scroll_to_top_on_train",
+        "pending_tab_click",
     ]
     for key in keys:
         st.session_state.pop(key, None)
     st.session_state["desired_students_count"] = _load_default_students_count()
+    st.session_state["next_scene_index"] = 0
+    st.session_state["last_saved_scene_index"] = -1
+    st.session_state["last_saved_log_len"] = 0
 
 
 def _handle_logout() -> None:
@@ -442,6 +639,7 @@ def start_case(case_id: str) -> None:
     st.session_state["scene_objective_keys"] = case_service.scene_objective_layout(case_id)
     st.session_state["advanced_scene_mask"] = None
     st.session_state["pre_question_correctness"] = []
+    st.session_state["last_saved_log_len"] = 0
 
 
 def _fetch_session_state() -> Dict[str, Any] | None:
@@ -451,6 +649,14 @@ def _fetch_session_state() -> Dict[str, Any] | None:
     data = get_interactive_session_state(session_id)
     if data.get("status") == "not_found":
         st.session_state["pbl_session_id"] = None
+        st.session_state["session_lost"] = True
+        user = st.session_state.get("user")
+        if user:
+            try:
+                record = load_active_session_for_user(user["id"])
+            except Exception:
+                record = None
+            st.session_state["pending_active_session"] = record
         return None
     return data
 
@@ -499,55 +705,103 @@ def render_login() -> None:
 
 
 def render_case_selection() -> None:
-    st.title("选择案例开始学习")
-    user = st.session_state.get("user")
-    if not user:
-        st.warning("请先登录。")
-        st.session_state["page"] = "login"
-        return
+    container = st.session_state.get("case_selection_container")
+    if container is None:
+        container = st.empty()
+        st.session_state["case_selection_container"] = container
+    with container.container():
+        st.title("选择案例开始学习")
+        user = st.session_state.get("user")
+        if not user:
+            st.warning("请先登录。")
+            st.session_state["page"] = "login"
+            return
 
-    history = fetch_user_history(user_id=user["id"])
-    recommended = case_service.recommend(history, top_k=3)
-    st.subheader("推荐案例")
-    rec_cols = st.columns(len(recommended) or 1)
-    for col, brief in zip(rec_cols, recommended):
-        with col:
-            st.markdown(f"**{brief.case_id}**")
-            st.caption(brief.title[:80])
-            st.write(brief.summary[:120] + ("..." if len(brief.summary) > 120 else ""))
-            if st.button("选择此案例", key=f"rec_{brief.case_id}"):
-                start_case(brief.case_id)
-                st.rerun()
+        saved_session = st.session_state.get("pending_active_session")
+        if saved_session:
+            metadata = saved_session.get("metadata") or {}
+            next_idx_raw = metadata.get("next_scene_index", 0)
+            try:
+                next_idx = max(0, int(next_idx_raw))
+            except Exception:
+                next_idx = 0
+            total_scenes_saved = metadata.get("total_scenes")
+            if isinstance(total_scenes_saved, int) and total_scenes_saved > 0:
+                display_scene = min(next_idx + 1, total_scenes_saved)
+                scene_hint = f"（已讨论至场景 {display_scene}/{total_scenes_saved}）"
+            else:
+                display_scene = next_idx + 1
+                scene_hint = f"（已讨论至场景 {display_scene}）" if next_idx else ""
+            st.info(
+                f"检测到未完成的讨论（案例 {saved_session.get('case_id')}）{scene_hint}，可继续或放弃。"
+            )
+            resume_col, discard_col = st.columns(2)
+            with resume_col:
+                if st.button("继续上次讨论", key="resume_saved_session"):
+                    _resume_saved_session(saved_session)
+            with discard_col:
+                if st.button("放弃该讨论", key="discard_saved_session"):
+                    _clear_active_session_record()
+                    st.success("已放弃保存的讨论。")
+                    st.rerun()
+                    st.stop()
 
-    st.subheader("全部案例列表")
-    others = case_service.remaining_cases([b.case_id for b in recommended])
-    options = [b.case_id for b in others]
-    case_map = {b.case_id: b for b in others}
-    selected = st.selectbox(
-        "或从列表中选择其他案例",
-        options,
-        format_func=lambda cid: f"{cid} - {case_map[cid].title[:40]}",
-        key="manual_case_select",
-    ) if options else None
-    if selected and st.button("选择此案例", key="start_manual_case"):
-        start_case(selected)
-        st.rerun()
+        history = fetch_user_history(user_id=user["id"])
+        department_options = sorted({dept for dept in case_service.departments.values()})
+        dept_placeholder = "department_choice"
+        preferred_dept = st.session_state.get(dept_placeholder)
+        if not history:
+            selected_dept = st.selectbox(
+                "请选择你感兴趣的科室以开始学习",
+                ["不限科室"] + department_options,
+                index=0 if not preferred_dept else (["不限科室"] + department_options).index(preferred_dept),
+                key="department_select_box",
+            )
+            preferred_dept = None if selected_dept == "不限科室" else selected_dept
+            st.session_state[dept_placeholder] = preferred_dept
+        else:
+            preferred_dept = None
+        recommended = case_service.recommend(history, top_k=3, department_filter=preferred_dept)
+        st.subheader("推荐案例")
+        rec_cols = st.columns(len(recommended) or 1)
+        for col, brief in zip(rec_cols, recommended):
+            with col:
+                st.markdown(f"**{brief.case_id}**")
+                st.caption(brief.title[:80])
+                st.write(brief.summary[:120] + ("..." if len(brief.summary) > 120 else ""))
+                if st.button("选择此案例", key=f"rec_{brief.case_id}"):
+                    start_case(brief.case_id)
+                    st.rerun()
 
-    st.subheader("最近学习记录")
-    if history:
-        history_rows = [
-            {
-                "案例": item["case_id"],
-                "开始": _format_timestamp(item["started_at"]),
-                "结束": _format_timestamp(item["ended_at"]),
-                "前测": item["pre_score"],
-                "后测": item["post_score"],
-            }
-            for item in history
-        ]
-        st.table(history_rows)
-    else:
-        st.info("暂无历史记录，选择任意案例开始吧！")
+        st.subheader("全部案例列表")
+        others = case_service.remaining_cases([b.case_id for b in recommended])
+        options = [b.case_id for b in others]
+        case_map = {b.case_id: b for b in others}
+        selected = st.selectbox(
+            "或从列表中选择其他案例",
+            options,
+            format_func=lambda cid: f"{cid} - {case_map[cid].title[:40]}",
+            key="manual_case_select",
+        ) if options else None
+        if selected and st.button("选择此案例", key="start_manual_case"):
+            start_case(selected)
+            st.rerun()
+
+        st.subheader("最近学习记录")
+        if history:
+            history_rows = [
+                {
+                    "案例": item["case_id"],
+                    "开始": _format_timestamp(item["started_at"]),
+                    "结束": _format_timestamp(item["ended_at"]),
+                    "前测": item["pre_score"],
+                    "后测": item["post_score"],
+                }
+                for item in history
+            ]
+            st.table(history_rows)
+        else:
+            st.info("暂无历史记录，选择任意案例开始吧！")
 
 
 def render_test_page(kind: str) -> None:
@@ -610,6 +864,23 @@ def render_test_page(kind: str) -> None:
     st.session_state[answers_key] = answers
     if st.button("提交测验", key=f"submit_{kind}_test"):
         tests_to_grade = st.session_state.get(test_key) or []
+        missing = []
+        for idx, item in enumerate(tests_to_grade, start=1):
+            qid = item.get("qid") or f"{kind}_{idx}"
+            options = item.get("option")
+            question_type = str(item.get("question_type", "")).lower()
+            is_multi = isinstance(options, dict) and "多" in question_type
+            if isinstance(options, dict) and options:
+                value = answers.get(qid)
+                if is_multi:
+                    if not value or not isinstance(value, list) or not [opt for opt in value if opt in options]:
+                        missing.append(idx)
+                else:
+                    if value not in options:
+                        missing.append(idx)
+        if missing:
+            st.warning(f"还有 {len(missing)} 道选择题未作答（题号：{', '.join(map(str, missing))}），请补充后再提交。")
+            return
         score = score_test_items(tests_to_grade, answers)
         if kind == "pre":
             st.session_state["pre_score"] = score
@@ -628,21 +899,51 @@ def render_test_page(kind: str) -> None:
 
 
 def render_pbl_training() -> None:
+    container = st.session_state.get("pbl_training_container")
+    if container is None:
+        container = st.empty()
+        st.session_state["pbl_training_container"] = container
+    with container.container():
+        _render_pbl_training_inner()
+
+
+def _render_pbl_training_inner() -> None:
     brief = st.session_state.get("case_brief")
     if not brief:
         st.session_state["page"] = "case_selection"
         st.rerun()
         return
-    session_state_data = _fetch_session_state()
-    status = session_state_data.get("status") if session_state_data else "idle"
     session_id = st.session_state.get("pbl_session_id")
     _sync_speed_to_session(session_id)
+    if session_id:
+        try:
+            heartbeat_session(session_id)
+        except Exception:
+            pass
+    session_state_data = _fetch_session_state()
+    status = session_state_data.get("status") if session_state_data else "idle"
     waiting_for_user = session_state_data.get("waiting_for_user") if session_state_data else False
+    session_lost = st.session_state.get("session_lost", False)
     st.title("PBL 讨论训练")
     st.markdown(
         "点击下方按钮即可与虚拟学习小组实时讨论。"
         "系统会按顺序推送同伴发言，你可以随时发表观点！"
+        "每个场景结束后系统会自动保存当前进度。"
     )
+    if st.session_state.pop("scroll_to_top_on_train", False):
+        components.html("""
+            <script>
+            setTimeout(function() {
+                window.scrollTo({top: 0, left: 0, behavior: 'auto'});
+            }, 150);
+            </script>
+        """, height=0)
+    if session_lost and not session_state_data:
+        st.warning("检测到实时会话已断开，保存的讨论进度仍保留在右侧案例选项中，可返回案例选择页继续。")
+        go_back = st.button("返回案例选择并恢复讨论", key="return_to_cases_from_loss")
+        if go_back:
+            st.session_state["page"] = "case_selection"
+            st.rerun()
     discussion_ran = bool(st.session_state.get("discussion_ran"))
     max_seen_scene = st.session_state.get("max_seen_scene", -1)
     total_scenes_configured = st.session_state.get("total_scenes") or 1
@@ -660,9 +961,13 @@ def render_pbl_training() -> None:
             else:
                 speed_factor = _current_speed_factor()
                 ability_window = _ability_window_from_pre_score(st.session_state.get("pre_score"))
+                _clear_active_session_record()
+                current_user = st.session_state.get("user") or {}
                 session_id = start_interactive_session(
                     case_id,
                     speed_factor=speed_factor,
+                    owner_user_id=current_user.get("id"),
+                    owner_username=current_user.get("username"),
                     ability_window=ability_window,
                     students_count=int(st.session_state.get("desired_students_count", 5)),
                     advanced_mask=st.session_state.get("advanced_scene_mask"),
@@ -672,6 +977,13 @@ def render_pbl_training() -> None:
                     "session_id": session_id,
                     "level": _current_speed_level(),
                 }
+                st.session_state["session_lost"] = False
+                st.session_state["scroll_to_top_on_train"] = True
+                total_scenes = st.session_state.get("total_scenes") or len(st.session_state.get("scene_objective_keys") or [])
+                st.session_state["pending_tab_click"] = 0 if total_scenes <= 1 else 0
+                st.session_state["scene_transition_ready_at"] = 0.0
+                st.session_state["scene_transition_waiting"] = False
+                st.session_state["last_transition_scene"] = -1
                 st.session_state["discussion_ran"] = False
                 st.session_state["agent_evaluation"] = None
                 st.session_state["agent_advice"] = None
@@ -700,6 +1012,7 @@ def render_pbl_training() -> None:
             st.session_state["agent_evaluation"] = session_state_data.get("evaluation")
             st.session_state["agent_advice"] = session_state_data.get("advice")
             st.session_state["agent_stats"] = session_state_data.get("student_stats")
+            _clear_active_session_record()
 
     log = st.session_state.get("pbl_log", [])
     teacher_message_count = sum(1 for entry in log if entry.get("speaker") == "Teacher")
@@ -776,6 +1089,15 @@ def render_pbl_training() -> None:
         last_entry = entries[-1]
         if last_entry.get("stage") == "end" and (last_entry.get("speaker") or "").lower() == "teacher":
             latest_completed_scene = max(latest_completed_scene, idx)
+    next_scene_idx = min(max(latest_completed_scene + 1, 0), total_scenes)
+    st.session_state["next_scene_index"] = next_scene_idx
+    prev_saved_scene = st.session_state.get("last_saved_scene_index", -1)
+    if latest_completed_scene >= 0 and latest_completed_scene > prev_saved_scene:
+        st.session_state["last_saved_scene_index"] = latest_completed_scene
+        if next_scene_idx < total_scenes:
+            _save_active_session_state(force=True, next_scene_index=next_scene_idx)
+        else:
+            _clear_active_session_record()
     last_transition_scene = st.session_state.get("last_transition_scene", -1)
     transition_ready_at = st.session_state.get("scene_transition_ready_at", 0.0)
     transition_waiting = st.session_state.get("scene_transition_waiting", False)
@@ -857,6 +1179,23 @@ def render_pbl_training() -> None:
                         st.markdown(content)
             else:
                 st.info("尚未生成讨论记录。")
+
+    pending_tab = st.session_state.pop("pending_tab_click", None)
+    if pending_tab is not None and 0 <= pending_tab < len(tab_labels):
+        components.html(
+            f"""
+            <script>
+            setTimeout(function() {{
+                const tabs = window.parent.document.querySelectorAll('div[data-testid="stTabs"] div[role="tab"]');
+                if (tabs[{pending_tab}]) {{
+                    tabs[{pending_tab}].click();
+                    tabs[{pending_tab}].scrollIntoView({{behavior: 'auto', block: 'start'}});
+                }}
+            }}, 200);
+            </script>
+            """,
+            height=0,
+        )
 
     chat_placeholder: str
     allow_input = st.session_state.get("allow_user_input", False)
@@ -1201,6 +1540,7 @@ def main() -> None:
     _restore_user_from_cookie()
     if st.session_state.get("user") and st.session_state.get("page") == "login":
         st.session_state["page"] = "case_selection"
+    _load_active_session_record()
 
     with st.sidebar:
         user = st.session_state.get("user")
@@ -1258,46 +1598,21 @@ def main() -> None:
                 value=int(profile_cache.get("age") or 0),
                 key="profile_age",
             )
-            gpa_score_value = st.number_input(
-                "GPA 分数",
-                min_value=0.0,
-                max_value=100.0,
-                step=0.1,
-                value=float(profile_cache.get("gpa_score") or 0.0),
-                key="profile_gpa_score",
-            )
-            gpa_max_value = st.number_input(
-                "GPA 满分",
-                min_value=0.0,
-                max_value=100.0,
-                step=0.1,
-                value=float(profile_cache.get("gpa_max") or 0.0),
-                key="profile_gpa_max",
-            )
             if st.button("保存基本信息", use_container_width=True):
-                if gpa_max_value <= 0 and gpa_score_value > 0:
-                    st.warning("请先填写 GPA 满分。")
-                elif gpa_max_value > 0 and gpa_score_value > gpa_max_value:
-                    st.warning("GPA 分数不能超过满分。")
-                else:
-                    try:
-                        upsert_user_profile(
-                            user_id=user["id"],
-                            gender=gender_value if gender_value != "未填写" else None,
-                            age=int(age_value) if age_value > 0 else None,
-                            gpa_score=float(gpa_score_value) if gpa_score_value > 0 else None,
-                            gpa_max=float(gpa_max_value) if gpa_max_value > 0 else None,
-                        )
-                        st.success("已保存基本信息。")
-                        st.session_state["user_profile_cache"] = {
-                            "user_id": user["id"],
-                            "gender": gender_value if gender_value != "未填写" else None,
-                            "age": int(age_value) if age_value > 0 else None,
-                            "gpa_score": float(gpa_score_value) if gpa_score_value > 0 else None,
-                            "gpa_max": float(gpa_max_value) if gpa_max_value > 0 else None,
-                        }
-                    except Exception as exc:
-                        st.error(f"保存失败：{exc}")
+                try:
+                    upsert_user_profile(
+                        user_id=user["id"],
+                        gender=gender_value if gender_value != "未填写" else None,
+                        age=int(age_value) if age_value > 0 else None,
+                    )
+                    st.success("已保存基本信息。")
+                    st.session_state["user_profile_cache"] = {
+                        "user_id": user["id"],
+                        "gender": gender_value if gender_value != "未填写" else None,
+                        "age": int(age_value) if age_value > 0 else None,
+                    }
+                except Exception as exc:
+                    st.error(f"保存失败：{exc}")
 
         st.markdown("### 意见与建议")
         suggestion_disabled = user is None
@@ -1335,6 +1650,11 @@ def main() -> None:
     if not st.session_state.get("user") and page != "login":
         st.session_state["page"] = "login"
         page = "login"
+
+    if page != "case_selection":
+        _clear_page_container("case_selection_container")
+    if page != "pbl_training":
+        _clear_page_container("pbl_training_container")
 
     if page == "login":
         render_login()

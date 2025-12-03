@@ -12,6 +12,7 @@ PBL 多agent（LangGraph）— 多场景/多触发点 & 场景级能力矩阵版
 
 from __future__ import annotations
 import os, json, math, random, re
+import logging
 from typing import Annotated, Sequence, TypedDict, List, Dict, Any
 from collections import defaultdict
 from pathlib import Path
@@ -31,6 +32,23 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 CASE_PATH = BASE_DIR / "data" / "case.json"
 PROMPTS_PATH = BASE_DIR / "prompts.json"
+
+logger = logging.getLogger("pbl.engine")
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
+logger.setLevel(logging.DEBUG)
+
+
+class StopRequested(Exception):
+    """Raised when an external stop event requests termination."""
+
+
+def _check_stop(cfg: Dict[str, Any]) -> None:
+    stop_event = cfg.get("stop_event")
+    if stop_event is not None:
+        is_set = getattr(stop_event, "is_set", None)
+        if callable(is_set) and stop_event.is_set():
+            raise StopRequested("stop requested")
 
 def _init_activeness(cfg: Dict[str, Any], students: List[str]) -> Dict[str, float]:
     """
@@ -783,11 +801,7 @@ class AdvisorAgent:
             except (TypeError, ValueError):
                 delta_text = "未提供"
         report_text = test_report or "（未提供测验题目表现）"
-        print(
-            "[AdvisorAgent] test_report:\n"
-            f"{report_text}",
-            flush=True,
-        )
+        # logger.info("[AdvisorAgent] test_report:\n%s", report_text)
         user_prompt = self.user_prompt_template.format(
             student=student,
             score_overview=self._score_overview(evaluation_result),
@@ -799,11 +813,7 @@ class AdvisorAgent:
             score_delta_text=delta_text,
             test_report=report_text,
         )
-        print(
-            "[AdvisorAgent] user_prompt:\n"
-            f"{user_prompt}",
-            flush=True,
-        )
+        # logger.debug("[AdvisorAgent] user_prompt:\n%s", user_prompt)
         raw = self.llm.invoke(
             [
                 {"role": "system", "content": self.system_prompt},
@@ -966,6 +976,7 @@ class StudentAgent:
         )
 
     def __call__(self, state: PBLState) -> Dict[str, Any]:
+        _check_stop(state["cfg"])
         stage = state["stage"]
         if stage not in ("discussion", "summary"):
             return {"next": "teacher"}
@@ -1198,6 +1209,7 @@ class TeacherAgent:
         return self.llm.invoke([sys_msg, user_msg], response_format="text")
 
     def __call__(self, state: PBLState) -> Dict[str, Any]:
+        _check_stop(state["cfg"])
         turn_event = state["cfg"].get("user_turn_event")
         students = state["cfg"]["students"]
         user_student_name = state["cfg"].get("user_student_name", "Student1")
@@ -1463,7 +1475,7 @@ def run_one_scene(scene_index: int,
     )
     objectives_scene = filtered_objectives
     if cfg.get("debug_print_abilities"):
-        print(f"\n[Scene {scene_index + 1}/{scene_total}] 学生能力采样：")
+        # logger.info("[Scene %s/%s] 学生能力采样：", scene_index + 1, scene_total)
         for stu in students:
             raw = abilities_raw.get(stu, {})
             desc = abilities_desc.get(stu, {})
@@ -1471,14 +1483,15 @@ def run_one_scene(scene_index: int,
                 f"{obj}={raw.get(obj, 0):.2f}"
                 for obj in filtered_objectives.keys()
             ]
-            print(
-                f"  - {stu}: "
-                f"{'; '.join(summary_bits)} | "
-                f"平均 {competence_avg.get(stu, 0):.2f}"
-            )
-            if desc:
-                for obj, text in desc.items():
-                    print(f"      · {obj}：{text}")
+            # logger.info(
+            #     "  - %s: %s | 平均 %.2f",
+            #     stu,
+            #     "; ".join(summary_bits),
+            #     competence_avg.get(stu, 0),
+            # )
+            # if desc:
+            #     for obj, text in desc.items():
+            #         logger.info("      · %s：%s", obj, text)
 
     # 编译本场景图
     graph = build_graph(cfg, prompts, students, knowledge)
@@ -1513,13 +1526,14 @@ def run_one_scene(scene_index: int,
     }
 
     # 流式运行
-    print(f"\n=== 场景 {scene_index+1} 开始 ===\n")
+    logger.info("=== 场景 %s 开始 ===", scene_index + 1)
     last_messages = init_messages[:]
     last_spoke = dict(init_last_spoke)
 
     current_stage = init_state["stage"]
     message_hook = cfg.get("message_hook")
     for update in graph.stream(init_state, config={"recursion_limit": cfg.get("recursion_limit", 400)}):
+        _check_stop(cfg)
         for node, val in update.items():
             if isinstance(val, dict):
                 if "stage" in val:
@@ -1527,7 +1541,7 @@ def run_one_scene(scene_index: int,
                 for msg in (val.get("messages",[]) or []):
                     speaker = getattr(msg,'name',msg.type)
                     if cfg.get("show_console", True):
-                        print(f"【{speaker}】:\n{msg.content}\n")
+                        logger.debug("【%s】：\n%s\n", speaker, msg.content)
                     last_messages.append(msg)
                     global_log.append({
                         "scene_index": scene_index,
@@ -1551,12 +1565,12 @@ def run_one_scene(scene_index: int,
                     last_spoke = val["last_spoke"]
                 if val.get("stage")=="end" or val.get("next")=="END":
                     if cfg.get("show_console", True):
-                        print(f"=== 场景 {scene_index+1} 结束 ===")
+                        logger.info("=== 场景 %s 结束 ===", scene_index + 1)
                     return last_messages, last_spoke
 
     # 正常不会到这里
     if cfg.get("show_console", True):
-        print(f"=== 场景 {scene_index+1} 结束（非常规） ===")
+        logger.info("=== 场景 %s 结束（非常规） ===", scene_index + 1)
     return last_messages, last_spoke
 
 
@@ -1644,7 +1658,16 @@ def initialize_system(
     return cfg, prompts, case, knowledge
 
 
-def run_pbl_multi_scene(case, cfg, prompts, knowledge):
+def run_pbl_multi_scene(
+    case,
+    cfg,
+    prompts,
+    knowledge,
+    *,
+    start_scene_index: int = 0,
+    prefill_log: List[Dict[str, Any]] | None = None,
+    prefill_stats: Dict[str, Dict[str, float]] | None = None,
+):
     scenes = case["contextualized_case"]
     objectives_all = case["objectives_by_scene"]
     assert len(scenes) == len(objectives_all), "contextualized_case 与 objectives_by_scene 场景数不一致"
@@ -1652,13 +1675,26 @@ def run_pbl_multi_scene(case, cfg, prompts, knowledge):
     carry_messages = None
     carry_last_spoke = None
     total_scenes = len(scenes)
-    global_log: List[Dict[str, Any]] = []
+    global_log: List[Dict[str, Any]] = list(prefill_log or [])
     student_stats: Dict[str, Dict[str, float]] = {
         s: {"message_count": 0.0, "char_count": 0.0}
         for s in cfg["students"]
     }
+    if isinstance(prefill_stats, dict):
+        for speaker, payload in prefill_stats.items():
+            if speaker in student_stats:
+                student_stats[speaker]["message_count"] = float(payload.get("message_count", 0.0))
+                student_stats[speaker]["char_count"] = float(payload.get("char_count", 0.0))
+            else:
+                student_stats[speaker] = {
+                    "message_count": float(payload.get("message_count", 0.0)),
+                    "char_count": float(payload.get("char_count", 0.0)),
+                }
 
-    for i, (scene_text, obj_scene) in enumerate(zip(scenes, objectives_all)):
+    for i in range(start_scene_index, total_scenes):
+        _check_stop(cfg)
+        scene_text = scenes[i]
+        obj_scene = objectives_all[i]
         carry_messages, carry_last_spoke = run_one_scene(
             scene_index=i,
             scene_total=total_scenes,
@@ -1672,6 +1708,7 @@ def run_pbl_multi_scene(case, cfg, prompts, knowledge):
             global_log=global_log,
             student_stats=student_stats,
         )
+        _check_stop(cfg)
 
     return global_log, student_stats
 
@@ -1690,7 +1727,7 @@ def run_case_evaluation(
     if not target:
         return None
     if knowledge is None:
-        print("\n[评估提示] 知识图谱不可用，将在无RAG的情况下直接评估学生发言。")
+        logger.warning("[评估提示] 知识图谱不可用，将在无RAG的情况下直接评估学生发言。")
     students = cfg.get("students", [])
     if target not in students:
         raise ValueError(f"未找到需要评估的学生：{target}")
@@ -1719,8 +1756,7 @@ def run_case_evaluation(
     )
     result = evaluator.evaluate(target, log, student_stats, students)
     if display:
-        print("\n=== 学生评估 ===")
-        print(render_evaluation_for_display(result))
+        logger.info("=== 学生评估 ===\n%s", render_evaluation_for_display(result))
     return result
 
 
@@ -1758,8 +1794,7 @@ def run_learning_advisor(
         test_report=test_report,
     )
     if display:
-        print("\n=== 学习建议 ===")
-        print(render_advice_for_display(advice))
+        logger.info("=== 学习建议 ===\n%s", render_advice_for_display(advice))
     return advice
 
 
@@ -1843,6 +1878,9 @@ def run_pbl_workflow(
     case_path: str = CASE_PATH,
     config_overrides: Dict[str, Any] | None = None,
     display: bool = False,
+    start_scene_index: int = 0,
+    prefill_log: List[Dict[str, Any]] | None = None,
+    prefill_stats: Dict[str, Dict[str, float]] | None = None,
 ) -> Dict[str, Any]:
     overrides = dict(config_overrides or {})
     if case_id:
@@ -1853,9 +1891,23 @@ def run_pbl_workflow(
         case_path=case_path,
         config_overrides=overrides,
     )
+    _check_stop(cfg)
     if not display:
         cfg["show_console"] = False
-    full_log, student_stats = run_pbl_multi_scene(case, cfg, prompts, knowledge)
+    start_scene_index = max(0, int(start_scene_index))
+    total_scenes = len(case["contextualized_case"])
+    if start_scene_index >= total_scenes:
+        start_scene_index = total_scenes
+    _check_stop(cfg)
+    full_log, student_stats = run_pbl_multi_scene(
+        case,
+        cfg,
+        prompts,
+        knowledge,
+        start_scene_index=start_scene_index,
+        prefill_log=prefill_log,
+        prefill_stats=prefill_stats,
+    )
     evaluation_result = run_case_evaluation(
         cfg, case, knowledge, full_log, student_stats, prompts, display=display
     )
