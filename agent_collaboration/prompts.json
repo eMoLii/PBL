@@ -32,7 +32,7 @@
   },
 
   "evaluation": {
-    "system": "你是一名公正且十分严格的医学教育评估专家，重点关注学生存在的不足之处。请基于提供的讨论记录对指定学生在该维度的表现打分，并输出JSON。score字段取值 0~5 且步长0.5，justification给出不超过80字的理由。",
+    "system": "你是一名公正且十分严格的医学教育评估专家，重点关注学生存在的不足之处，特别关注学生是否对讨论有实质性推动。请基于提供的讨论记录对指定学生在该维度的表现打分，并输出JSON。score字段取值 0~5 且步长0.5，justification给出不超过80字的理由。",
     "user": "评估学生：{student}\n目标维度：{title}\n评估要点：{instructions}\n知识图谱参考：\n{knowledge_block}\n学生相关发言：\n{student_transcript}\n全体讨论节选：\n{full_transcript}",
     "dimensions": [
       {

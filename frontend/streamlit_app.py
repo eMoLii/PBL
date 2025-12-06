@@ -49,7 +49,6 @@ from backend.services import (  # noqa: E402
     save_active_session_for_user,
     load_active_session_for_user,
     clear_active_session_for_user,
-    heartbeat_session,
 )
 
 OBJ_TAG_PATTERN = re.compile(r"<\s*OBJ\s*:\s*(.+?)>")
@@ -271,6 +270,9 @@ def _resume_saved_session(entry: Dict[str, Any]) -> None:
     st.session_state["desired_students_count"] = metadata.get("desired_students_count", st.session_state.get("desired_students_count"))
     prefill_log = metadata.get("log", [])
     st.session_state["pbl_log"] = list(prefill_log)
+    st.session_state["last_force_speak_total"] = sum(
+        1 for entry in prefill_log if _is_student_speaker(entry.get("speaker"))
+    )
     total_scenes = st.session_state.get("total_scenes") or len(st.session_state.get("scene_objective_keys") or [])
     if total_scenes and next_scene_index >= total_scenes:
         st.info("该讨论已完成，无法继续。")
@@ -454,6 +456,7 @@ def initialize_app_state() -> None:
         ("session_lost", False),
         ("scroll_to_top_on_train", False),
         ("pending_tab_click", None),
+        ("last_force_speak_total", 0),
     ):
         if key not in st.session_state:
             st.session_state[key] = default
@@ -510,6 +513,7 @@ def reset_case_state() -> None:
         "session_lost",
         "scroll_to_top_on_train",
         "pending_tab_click",
+        "last_force_speak_total",
     ]
     for key in keys:
         st.session_state.pop(key, None)
@@ -605,10 +609,17 @@ def _chat_role_and_avatar(speaker: str | None) -> tuple[str, Optional[str]]:
     return "assistant", "💬"
 
 
+def _is_student_speaker(label: Optional[str]) -> bool:
+    if not label:
+        return False
+    return str(label).lower().startswith("student")
+
+
 def start_case(case_id: str) -> None:
     st.session_state["selected_case_id"] = case_id
     st.session_state["case_brief"] = case_service.to_brief(case_id)
     st.session_state["session_start"] = datetime.now(timezone.utc).isoformat()
+    st.session_state["session_saved"] = False
     st.session_state["pre_answers"] = {}
     st.session_state["post_answers"] = {}
     st.session_state["pre_score"] = None
@@ -640,6 +651,7 @@ def start_case(case_id: str) -> None:
     st.session_state["advanced_scene_mask"] = None
     st.session_state["pre_question_correctness"] = []
     st.session_state["last_saved_log_len"] = 0
+    st.session_state["last_force_speak_total"] = 0
 
 
 def _fetch_session_state() -> Dict[str, Any] | None:
@@ -915,11 +927,6 @@ def _render_pbl_training_inner() -> None:
         return
     session_id = st.session_state.get("pbl_session_id")
     _sync_speed_to_session(session_id)
-    if session_id:
-        try:
-            heartbeat_session(session_id)
-        except Exception:
-            pass
     session_state_data = _fetch_session_state()
     status = session_state_data.get("status") if session_state_data else "idle"
     waiting_for_user = session_state_data.get("waiting_for_user") if session_state_data else False
@@ -1015,6 +1022,9 @@ def _render_pbl_training_inner() -> None:
             _clear_active_session_record()
 
     log = st.session_state.get("pbl_log", [])
+    total_student_messages = sum(
+        1 for entry in log if _is_student_speaker(entry.get("speaker"))
+    )
     teacher_message_count = sum(1 for entry in log if entry.get("speaker") == "Teacher")
     last_teacher_seen = st.session_state.get("last_teacher_seen_count", 0)
     if teacher_message_count > last_teacher_seen:
@@ -1049,6 +1059,22 @@ def _render_pbl_training_inner() -> None:
         pending_queue.pop(0)
         new_seen -= 1
     st.session_state["student1_log_seen"] = current_seen
+    students_total_raw = st.session_state.get("desired_students_count")
+    try:
+        students_total = int(students_total_raw)
+    except (TypeError, ValueError):
+        students_total = _load_default_students_count()
+    students_total = max(1, students_total)
+    last_forced_total = st.session_state.get("last_force_speak_total", 0)
+    need_force = (
+        session_id
+        and total_student_messages > (2 * students_total)
+        and current_seen < (total_student_messages / (2.0 * students_total))
+        and not waiting_for_user
+    )
+    if need_force and total_student_messages > last_forced_total:
+        _trigger_user_turn(session_id, allow_input=True)
+        st.session_state["last_force_speak_total"] = total_student_messages
     if not session_id:
         st.session_state["pbl_turn_requested"] = False
     elif waiting_for_user:
@@ -1488,6 +1514,12 @@ def render_evaluation_page() -> None:
                 advice_ready = True
         except Exception as exc:
             st.warning(f"更新学习建议失败：{exc}")
+    if not evaluation or not isinstance(evaluation.get("dimensions"), dict):
+        st.info("讨论评估尚未完成，请稍候…")
+        time.sleep(2.0)
+        st.rerun()
+        return
+
     st.subheader("PBL讨论各维度得分")
     for dim in evaluation["dimensions"].values():
         st.markdown(f"- **{dim['title']}**：{dim['score']} 分（{dim['justification']}）")

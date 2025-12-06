@@ -238,9 +238,9 @@ class PBLInteractiveSession:
         self.cfg_snapshot: Dict[str, Any] | None = None
         self.prompts_snapshot: Dict[str, Any] | None = None
         self.last_active = time.time()
-        self.user_last_heartbeat = time.time()
         self.stop_event = threading.Event()
         self.stop_requested = False
+        self.completed_at: float | None = None
 
     def start(self) -> None:
         self.status = "running"
@@ -250,17 +250,13 @@ class PBLInteractiveSession:
     def touch(self) -> None:
         self.last_active = time.time()
 
-    def heartbeat(self) -> None:
-        with self.state_lock:
-            self.user_last_heartbeat = time.time()
-
     def is_finished(self) -> bool:
         return self.status in {"completed", "error", "stopped"}
 
     def is_expired(self, now: float, timeout: float) -> bool:
         if timeout <= 0 or self.is_finished():
             return False
-        return (now - self.user_last_heartbeat) >= timeout
+        return (now - self.last_active) >= timeout
 
     def _run(self) -> None:
         try:
@@ -326,6 +322,8 @@ class PBLInteractiveSession:
             self.status = "error"
         finally:
             self.waiting_for_user = False
+            if self.is_finished():
+                self.completed_at = time.time()
 
     def refresh_advice_with_tests(
         self,
@@ -485,6 +483,7 @@ class PBLSessionManager:
         self.lock = threading.Lock()
         self.pause_interval = pause_interval
         self.session_timeout = max(60.0, float(session_timeout_minutes) * 60.0)
+        self.completed_retention = max(self.session_timeout, 300.0)
         self._stop_cleaner = threading.Event()
         self._cleaner_thread = threading.Thread(target=self._cleaner_loop, daemon=True)
         self._cleaner_thread.start()
@@ -503,14 +502,21 @@ class PBLSessionManager:
             removed: List[tuple[str, PBLInteractiveSession]] = []
             for sid, session in list(self.sessions.items()):
                 expired = session.is_expired(now, self.session_timeout)
-                if expired and not session.is_finished():
+                finished = session.is_finished()
+                remove = False
+                if expired and not finished:
                     logger.info(
-                        "[SessionManager] Heartbeat lost for session %s (owner=%s), requesting stop.",
+                        "[SessionManager] Session %s (owner=%s) expired due to inactivity, requesting stop.",
                         sid,
                         session.owner_username or session.owner_user_id or "unknown",
                     )
                     session.stop()
-                if session.is_finished() or expired:
+                    remove = True
+                elif finished:
+                    completed_at = session.completed_at or now
+                    if (now - completed_at) >= self.completed_retention:
+                        remove = True
+                if remove:
                     removed.append((sid, session))
             for sid, _ in removed:
                 self.sessions.pop(sid, None)
@@ -595,13 +601,6 @@ class PBLSessionManager:
         if not session:
             raise KeyError("session not found")
         session.resume_discussion()
-
-    def heartbeat(self, session_id: str) -> None:
-        self._cleanup_expired_sessions()
-        session = self.sessions.get(session_id)
-        if not session:
-            raise KeyError("session not found")
-        session.heartbeat()
 
     def set_speed_factor(self, session_id: str, factor: float) -> None:
         self._cleanup_expired_sessions()
@@ -689,10 +688,6 @@ def request_user_turn(session_id: str) -> None:
 
 def resume_user_turn(session_id: str) -> None:
     _SESSION_MANAGER.resume(session_id)
-
-
-def heartbeat_session(session_id: str) -> None:
-    _SESSION_MANAGER.heartbeat(session_id)
 
 
 def set_session_speed(session_id: str, speed_factor: float) -> None:
