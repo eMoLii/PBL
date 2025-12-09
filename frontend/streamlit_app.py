@@ -23,6 +23,7 @@ from backend.database import (  # noqa: E402
     init_db,
     record_feedback,
     record_study_session,
+    record_survey_response,
     seed_users,
     verify_user,
     create_session_token,
@@ -30,6 +31,8 @@ from backend.database import (  # noqa: E402
     delete_session_token,
     get_user_profile,
     upsert_user_profile,
+    get_user_settings,
+    upsert_user_settings,
 )
 from backend.services import (  # noqa: E402
     POST_TEST_ANSWERS,
@@ -77,6 +80,23 @@ SESSION_COOKIE_NAME = "pbl_session_token"
 SESSION_COOKIE_DAYS = 30
 ADVANCED_OBJECTIVE_THRESHOLD = 0.5
 
+SURVEY_QUESTIONS = [
+    "我对本次使用该 PBL 讨论系统的整体体验感到满意。",
+    "我认为该系统有助于我理解并掌握本病例的临床推理过程。",
+    "我在讨论中始终保持投入，并积极参与推理与决策。",
+    "我在讨论中能够按自己期望的方式表达观点并主导推理。",
+    "虚拟学生的发言促使我更深入地思考并参与讨论。",
+    "教师的引导/监督让我感到被支持，并能推动讨论朝正确方向。",
+    "当我困惑或偏离主题时，系统能及时提供有效提示或纠偏。",
+    "通过本次讨论，我对自己独立分析病例并形成诊断思路更有信心。",
+    "我有信心将本次学到的推理方法迁移到相似病例中。",
+    "在该系统中完成我的角色任务需要投入较大脑力负荷。",
+    "在讨论过程中，我经常感到信息量过大或步骤过于复杂。",
+    "系统界面/提示/虚拟学生的互动让我分心，影响我聚焦病例关键线索。",
+]
+
+SURVEY_CHOICES = ["非常同意", "比较同意", "不确定", "比较不同意", "非常不同意"]
+
 
 def _current_speed_level() -> int:
     level = int(st.session_state.get("speech_speed_level", 4))
@@ -96,6 +116,48 @@ def _load_default_students_count() -> int:
         return int(data.get("students_count", 5))
     except Exception:
         return 5
+
+
+def _apply_user_preferences(user_id: int) -> None:
+    try:
+        prefs = get_user_settings(user_id) or {}
+    except Exception as exc:
+        st.warning(f"加载个性化设置失败：{exc}")
+        return
+    speed = prefs.get("speed_level")
+    if isinstance(speed, int) and 1 <= speed <= 7:
+        st.session_state["speech_speed_level"] = speed
+        st.session_state["persisted_speed_level"] = speed
+    else:
+        st.session_state["persisted_speed_level"] = st.session_state.get("speech_speed_level", 4)
+    count = prefs.get("student_count")
+    if isinstance(count, int) and 4 <= count <= 8:
+        st.session_state["desired_students_count"] = count
+        st.session_state["persisted_student_count"] = count
+    else:
+        st.session_state["persisted_student_count"] = st.session_state.get(
+            "desired_students_count", _load_default_students_count()
+        )
+
+
+def _persist_user_preferences(
+    *,
+    speed_level: Optional[int] = None,
+    student_count: Optional[int] = None,
+) -> bool:
+    user = st.session_state.get("user")
+    if not user or (speed_level is None and student_count is None):
+        return False
+    try:
+        upsert_user_settings(
+            user_id=user["id"],
+            speed_level=speed_level,
+            student_count=student_count,
+        )
+        return True
+    except Exception as exc:
+        st.warning(f"保存个性化设置失败：{exc}")
+        return False
 
 
 def _ability_window_from_pre_score(pre_score: float | None) -> tuple[float, float] | None:
@@ -374,6 +436,7 @@ def _restore_user_from_cookie() -> None:
     if user:
         st.session_state["user"] = user
         st.session_state["session_token"] = token
+        _apply_user_preferences(user["id"])
     else:
         _clear_session_cookie()
 
@@ -389,6 +452,13 @@ def _render_speed_slider() -> None:
         key="speech_speed_slider",
     )
     st.session_state["speech_speed_level"] = level
+    user = st.session_state.get("user")
+    if user:
+        if st.session_state.get("persisted_speed_level") != level:
+            if _persist_user_preferences(speed_level=level):
+                st.session_state["persisted_speed_level"] = level
+    else:
+        st.session_state["persisted_speed_level"] = level
     desc = SPEECH_SPEED_DESCRIPTIONS.get(level, "默认速度")
     st.caption(desc)
 
@@ -457,13 +527,20 @@ def initialize_app_state() -> None:
         ("scroll_to_top_on_train", False),
         ("pending_tab_click", None),
         ("last_force_speak_total", 0),
+        ("survey_answers", {}),
+        ("persisted_speed_level", None),
+        ("persisted_student_count", None),
     ):
         if key not in st.session_state:
             st.session_state[key] = default
     if st.session_state.get("desired_students_count") is None:
         st.session_state["desired_students_count"] = _load_default_students_count()
+    if st.session_state.get("persisted_student_count") is None:
+        st.session_state["persisted_student_count"] = st.session_state["desired_students_count"]
     if "speech_speed_level" not in st.session_state:
         st.session_state["speech_speed_level"] = 4
+    if st.session_state.get("persisted_speed_level") is None:
+        st.session_state["persisted_speed_level"] = st.session_state["speech_speed_level"]
     if "speed_sync" not in st.session_state:
         st.session_state["speed_sync"] = None
 
@@ -517,7 +594,13 @@ def reset_case_state() -> None:
     ]
     for key in keys:
         st.session_state.pop(key, None)
-    st.session_state["desired_students_count"] = _load_default_students_count()
+    preferred = st.session_state.get("persisted_student_count")
+    if isinstance(preferred, int) and 4 <= preferred <= 8:
+        st.session_state["desired_students_count"] = preferred
+    else:
+        default_count = _load_default_students_count()
+        st.session_state["desired_students_count"] = default_count
+        st.session_state["persisted_student_count"] = default_count
     st.session_state["next_scene_index"] = 0
     st.session_state["last_saved_scene_index"] = -1
     st.session_state["last_saved_log_len"] = 0
@@ -532,6 +615,11 @@ def _handle_logout() -> None:
             pass
     _clear_session_cookie()
     st.session_state.pop("user", None)
+    st.session_state["speech_speed_level"] = 4
+    st.session_state["persisted_speed_level"] = 4
+    default_count = _load_default_students_count()
+    st.session_state["desired_students_count"] = default_count
+    st.session_state["persisted_student_count"] = default_count
     reset_case_state()
     st.session_state["page"] = "login"
 
@@ -709,6 +797,7 @@ def render_login() -> None:
             except Exception as exc:
                 st.warning(f"创建会话失败：{exc}")
             st.session_state["user"] = user
+            _apply_user_preferences(user["id"])
             st.session_state["page"] = "case_selection"
             st.success("登录成功！")
             st.rerun()
@@ -907,6 +996,46 @@ def render_test_page(kind: str) -> None:
         else:
             st.session_state["post_score"] = score
             st.session_state["page"] = "evaluation"
+        st.rerun()
+
+
+def render_survey_page() -> None:
+    st.title("PBL 讨论体验调查问卷")
+    st.write(
+        "请结合你在本系统中的学习体验，使用 5 分量表为以下陈述打分。"
+        "结果仅用于改进产品，不会影响你的成绩。"
+    )
+    st.info("量表含义：非常同意 ＞ 比较同意 ＞ 不确定 ＞ 比较不同意 ＞ 非常不同意。")
+    responses = st.session_state.setdefault("survey_answers", {})
+    for idx, question in enumerate(SURVEY_QUESTIONS, start=1):
+        qid = f"survey_q_{idx}"
+        default_choice = responses.get(qid, SURVEY_CHOICES[2])
+        st.markdown(f"**Q{idx}. {question}**")
+        choice = st.radio(
+            "",
+            SURVEY_CHOICES,
+            index=SURVEY_CHOICES.index(default_choice),
+            key=f"survey_radio_{idx}",
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+        responses[qid] = choice
+        if idx < len(SURVEY_QUESTIONS):
+            st.divider()
+    user = st.session_state.get("user")
+    case_id = st.session_state.get("selected_case_id")
+    if st.button("提交问卷", key="submit_survey", use_container_width=True):
+        try:
+            record_survey_response(
+                user_id=user["id"] if user else None,
+                case_id=case_id,
+                answers=responses,
+            )
+            st.success("感谢填写，问卷已成功提交！")
+        except Exception as exc:
+            st.error(f"提交问卷失败：{exc}")
+    if st.button("返回推荐页面", use_container_width=True):
+        st.session_state["page"] = "case_selection"
         st.rerun()
 
 
@@ -1599,6 +1728,13 @@ def main() -> None:
         )
         if not students_locked and new_count != current_count:
             st.session_state["desired_students_count"] = new_count
+            user = st.session_state.get("user")
+            if user:
+                if st.session_state.get("persisted_student_count") != new_count:
+                    if _persist_user_preferences(student_count=new_count):
+                        st.session_state["persisted_student_count"] = new_count
+            else:
+                st.session_state["persisted_student_count"] = new_count
         if students_locked:
             st.caption("讨论进行中，人数设置暂不可调整。")
 
@@ -1645,6 +1781,19 @@ def main() -> None:
                     }
                 except Exception as exc:
                     st.error(f"保存失败：{exc}")
+
+        st.markdown("---")
+        allow_survey = page_state in {"case_selection", "evaluation"}
+        if st.button(
+            "填写调查问卷",
+            key="sidebar_survey_button",
+            use_container_width=True,
+            disabled=not allow_survey,
+        ):
+            st.session_state["page"] = "survey"
+            st.rerun()
+        if not allow_survey:
+            st.caption("问卷仅可在推荐或评估页面填写。")
 
         st.markdown("### 意见与建议")
         suggestion_disabled = user is None
@@ -1698,6 +1847,8 @@ def main() -> None:
         render_pbl_training()
     elif page == "post_test":
         render_test_page("post")
+    elif page == "survey":
+        render_survey_page()
     elif page == "evaluation":
         render_evaluation_page()
     else:

@@ -92,6 +92,28 @@ def init_db(db_path: Optional[Path] = None) -> None:
     )
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS survey_responses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            case_id TEXT,
+            answers_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            speech_speed_level INTEGER,
+            student_count INTEGER,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS active_sessions (
             user_id INTEGER PRIMARY KEY,
             case_id TEXT NOT NULL,
@@ -208,6 +230,75 @@ def record_feedback(user_id: int, content: str, created_at: Optional[str] = None
         VALUES (?, ?, ?)
         """,
         (user_id, content.strip(), timestamp),
+    )
+    conn.commit()
+    conn.close()
+
+
+def record_survey_response(
+    user_id: Optional[int],
+    case_id: Optional[str],
+    answers: Dict[str, Any],
+    created_at: Optional[str] = None,
+) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    timestamp = created_at or datetime.now(timezone.utc).isoformat()
+    cur.execute(
+        """
+        INSERT INTO survey_responses (user_id, case_id, answers_json, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            case_id,
+            json.dumps(answers, ensure_ascii=False),
+            timestamp,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_settings(user_id: int) -> Optional[Dict[str, Optional[int]]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT speech_speed_level, student_count FROM user_settings WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "speed_level": row["speech_speed_level"],
+        "student_count": row["student_count"],
+    }
+
+
+def upsert_user_settings(
+    user_id: int,
+    speed_level: Optional[int] = None,
+    student_count: Optional[int] = None,
+) -> None:
+    if speed_level is None and student_count is None:
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO user_settings (user_id, speech_speed_level, student_count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            speech_speed_level=COALESCE(excluded.speech_speed_level, user_settings.speech_speed_level),
+            student_count=COALESCE(excluded.student_count, user_settings.student_count)
+        """,
+        (
+            user_id,
+            speed_level,
+            student_count,
+        ),
     )
     conn.commit()
     conn.close()
