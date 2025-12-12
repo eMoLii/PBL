@@ -111,7 +111,12 @@ class CaseService:
             if not cid or cid not in self.case_ids:
                 continue
             hist_ids.append(cid)
-            score = item.get("post_score") or item.get("pre_score") or 60.0
+            score = (
+                item.get("composite_score")
+                or item.get("post_score")
+                or item.get("pre_score")
+                or 60.0
+            )
             scores.append(max(0.0, min(5.0, float(score) / 20.0)))
         if not hist_ids:
             eligible = [cid for cid in self.case_ids if not dept_clean or self.departments.get(cid) == dept_clean]

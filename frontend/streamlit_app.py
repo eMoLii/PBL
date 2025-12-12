@@ -897,6 +897,7 @@ def render_case_selection() -> None:
                     "结束": _format_timestamp(item["ended_at"]),
                     "前测": item["pre_score"],
                     "后测": item["post_score"],
+                    "综合": item.get("composite_score"),
                 }
                 for item in history
             ]

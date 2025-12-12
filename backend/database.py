@@ -11,6 +11,12 @@ from datetime import datetime, timezone
 DB_PATH = Path(__file__).resolve().parent / "data" / "pbl.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+DEFAULT_COMPOSITE_WEIGHTS = {
+    "pre": 0.25,
+    "post": 1.0,
+    "dimension": 0.25,
+}
+
 
 def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
     path = Path(db_path) if db_path else DB_PATH
@@ -41,6 +47,7 @@ def init_db(db_path: Optional[Path] = None) -> None:
             ended_at TEXT NOT NULL,
             pre_score REAL,
             post_score REAL,
+            composite_score REAL,
             evaluation_json TEXT,
             advice_json TEXT,
             FOREIGN KEY(user_id) REFERENCES users(id)
@@ -120,12 +127,31 @@ def init_db(db_path: Optional[Path] = None) -> None:
             session_id TEXT,
             metadata_json TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
+        FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """
     )
+    _ensure_column(conn, "study_sessions", "composite_score", "REAL")
     conn.commit()
     conn.close()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_def: str) -> None:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [row[1] for row in cur.fetchall()]
+    if column not in cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")
+        conn.commit()
+
+
+def migrate_add_composite_score(db_path: Optional[Path] = None) -> None:
+    """Add composite_score column if missing (idempotent)."""
+    conn = get_connection(db_path)
+    try:
+        _ensure_column(conn, "study_sessions", "composite_score", "REAL")
+    finally:
+        conn.close()
 
 
 def seed_users(users: Iterable[tuple[str, str]] | None = None) -> None:
@@ -142,6 +168,57 @@ def seed_users(users: Iterable[tuple[str, str]] | None = None) -> None:
         )
     conn.commit()
     conn.close()
+
+
+def _normalize_score(score: Any, max_score: float) -> Optional[float]:
+    try:
+        val = float(score)
+    except (TypeError, ValueError):
+        return None
+    val = max(0.0, min(val, max_score))
+    return val / max_score
+
+
+def compute_composite_score(
+    pre_score: Any,
+    post_score: Any,
+    evaluation: Dict[str, Any] | None,
+    weights: Optional[Dict[str, float]] = None,
+) -> Optional[float]:
+    """
+    依据前测/后测（0-100）和五个维度得分（0-5）加权求综合分，输出 0-100。
+    """
+    w = weights or DEFAULT_COMPOSITE_WEIGHTS
+    total = 0.0
+    wsum = 0.0
+
+    pre_n = _normalize_score(pre_score, 100.0)
+    post_n = _normalize_score(post_score, 100.0)
+    if pre_n is not None:
+        wp = w.get("pre", 0.0)
+        total += pre_n * wp
+        wsum += wp
+    if post_n is not None:
+        wp = w.get("post", 0.0)
+        total += post_n * wp
+        wsum += wp
+
+    dims = {}
+    if isinstance(evaluation, dict):
+        dims = evaluation.get("dimensions") or {}
+    for payload in dims.values():
+        if not isinstance(payload, dict):
+            continue
+        dim_n = _normalize_score(payload.get("score"), 5.0)
+        if dim_n is None:
+            continue
+        wp = w.get("dimension", 0.0)
+        total += dim_n * wp
+        wsum += wp
+
+    if wsum <= 0:
+        return None
+    return round((total / wsum) * 100.0, 2)
 
 
 def verify_user(username: str, password: str) -> Optional[Dict[str, Any]]:
@@ -163,7 +240,7 @@ def fetch_user_history(user_id: int, limit: int = 5) -> List[Dict[str, Any]]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT case_id, pre_score, post_score, evaluation_json, advice_json, started_at, ended_at
+        SELECT case_id, pre_score, post_score, composite_score, evaluation_json, advice_json, started_at, ended_at
         FROM study_sessions
         WHERE user_id = ?
         ORDER BY started_at DESC
@@ -179,6 +256,7 @@ def fetch_user_history(user_id: int, limit: int = 5) -> List[Dict[str, Any]]:
             "case_id": row["case_id"],
             "pre_score": row["pre_score"],
             "post_score": row["post_score"],
+            "composite_score": row["composite_score"],
             "evaluation": json.loads(row["evaluation_json"]) if row["evaluation_json"] else None,
             "advice": json.loads(row["advice_json"]) if row["advice_json"] else None,
             "started_at": row["started_at"],
@@ -199,11 +277,12 @@ def record_study_session(
 ) -> None:
     conn = get_connection()
     cur = conn.cursor()
+    composite = compute_composite_score(pre_score, post_score, evaluation)
     cur.execute(
         """
         INSERT INTO study_sessions (
-            user_id, case_id, started_at, ended_at, pre_score, post_score, evaluation_json, advice_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            user_id, case_id, started_at, ended_at, pre_score, post_score, composite_score, evaluation_json, advice_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
@@ -212,6 +291,7 @@ def record_study_session(
             ended_at,
             float(pre_score),
             float(post_score),
+            composite,
             json.dumps(evaluation, ensure_ascii=False),
             json.dumps(advice, ensure_ascii=False),
         ),
