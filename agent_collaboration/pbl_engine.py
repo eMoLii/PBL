@@ -32,6 +32,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 CASE_PATH = BASE_DIR / "data" / "case.json"
 PROMPTS_PATH = BASE_DIR / "prompts.json"
+PROMPTS_EN_PATH = BASE_DIR / "prompts_en.json"
 
 logger = logging.getLogger("pbl.engine")
 if not logging.getLogger().handlers:
@@ -489,6 +490,8 @@ class EvaluationAgent:
         prompt_bundle: Dict[str, str] | None = None,
         activeness_sigmoid_a: float = 3.0,
         dimension_defs: Sequence[Dict[str, Any]] | None = None,
+        language: str = "zh",
+        student_char_boost: float = 1.0,
     ):
         self.llm = llm
         self.knowledge = knowledge
@@ -505,6 +508,8 @@ class EvaluationAgent:
         if not dimension_defs:
             raise ValueError("evaluation prompts 未提供维度定义，请在 prompts.json.evaluation.dimensions 中配置。")
         self.dimension_defs = self._normalize_dimension_defs(dimension_defs)
+        self.language = str(language or "zh").lower()
+        self.student_char_boost = float(student_char_boost or 1.0)
 
     @staticmethod
     def _normalize_dimension_defs(defs: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -655,7 +660,7 @@ class EvaluationAgent:
         avg_count = sum(counts) / len(counts) if counts else 0.0
         avg_char = sum(chars) / len(chars) if chars else 0.0
         stu_count = student_stats.get(student, {}).get("message_count", 0.0)
-        stu_char = student_stats.get(student, {}).get("char_count", 0.0)
+        stu_char = student_stats.get(student, {}).get("char_count", 0.0) * self.student_char_boost
         ratio_count = stu_count / avg_count if avg_count > 0 else 1.0
         ratio_char = stu_char / avg_char if avg_char > 0 else 1.0
         eps = 1e-6
@@ -666,9 +671,18 @@ class EvaluationAgent:
         sigmoid = 1.0 / (1.0 + math.exp(-a * (combined_ratio - 1.0)))
         score_cont = 5.0 * sigmoid
         score = discretize_score(score_cont)
-        justification = (
-            f"发言{int(stu_count)}次（平均{avg_count:.1f}），字数约{int(stu_char)}（平均{avg_char:.1f}）")
-        return {"title": "参与度", "score": score, "justification": justification}
+        if self.language.startswith("en"):
+            justification = (
+                f"Spoke {int(stu_count)} times (avg {avg_count:.1f}), "
+                f"about {int(stu_char)} chars (avg {avg_char:.1f})"
+            )
+            title = "Participation"
+        else:
+            justification = (
+                f"发言{int(stu_count)}次（平均{avg_count:.1f}），字数约{int(stu_char)}（平均{avg_char:.1f}）"
+            )
+            title = "参与度"
+        return {"title": title, "score": score, "justification": justification}
 
     def evaluate(
         self,
@@ -1633,8 +1647,8 @@ def load_knowledge_graph(cfg: Dict[str, Any]) -> KnowledgeGraphRAG | None:
 
 def initialize_system(
     config_path: str = CONFIG_PATH,
-    prompts_path: str = PROMPTS_PATH,
-    case_path: str = CASE_PATH,
+    prompts_path: str | None = None,
+    case_path: str | None = None,
     config_overrides: Dict[str, Any] | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], KnowledgeGraphRAG | None]:
     """
@@ -1646,8 +1660,14 @@ def initialize_system(
         cfg = json.load(f)
     if config_overrides:
         cfg.update(config_overrides)
+
+    lang = str(cfg.get("language", "zh")).lower()
+    if not prompts_path:
+        prompts_path = PROMPTS_EN_PATH if lang.startswith("en") else PROMPTS_PATH
     with open(prompts_path, "r", encoding="utf-8") as f:
         prompts = json.load(f)
+
+    case_path = case_path or cfg.get("case_path") or CASE_PATH
 
     _prepare_students(cfg)
     ini_env(cfg)
@@ -1753,6 +1773,8 @@ def run_case_evaluation(
         prompt_bundle=eval_prompts,
         activeness_sigmoid_a=float(cfg.get("activeness_sigmoid_a", 3.0)),
         dimension_defs=dimension_defs,
+        language=str(cfg.get("language", "zh")).lower(),
+        student_char_boost=float(cfg.get("user_char_boost", 1.5)),
     )
     result = evaluator.evaluate(target, log, student_stats, students)
     if display:
@@ -1874,8 +1896,8 @@ def run_pbl_workflow(
     case_id: str | None = None,
     *,
     config_path: str = CONFIG_PATH,
-    prompts_path: str = PROMPTS_PATH,
-    case_path: str = CASE_PATH,
+    prompts_path: str | None = None,
+    case_path: str | None = None,
     config_overrides: Dict[str, Any] | None = None,
     display: bool = False,
     start_scene_index: int = 0,

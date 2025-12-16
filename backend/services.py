@@ -40,13 +40,37 @@ MATRIX_PATH = BASE_DIR / "agent_collaboration" / "data" / "case_similarity_matri
 CONFIG_PATH = BASE_DIR / "agent_collaboration" / "config.json"
 
 
-def _load_session_timeout_minutes() -> float:
+def _load_config() -> Dict[str, Any]:
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as f:
-            cfg = json.load(f)
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _load_session_timeout_minutes() -> float:
+    cfg = _load_config()
+    try:
         return float(cfg.get("session_timeout_minutes", 30.0))
     except Exception:
         return 30.0
+
+
+def _load_completed_retention_minutes() -> float:
+    cfg = _load_config()
+    try:
+        return float(cfg.get("completed_session_retention_minutes", 720.0))
+    except Exception:
+        return 720.0
+
+
+def _resolve_path(path_value: str | None, default: Path) -> Path:
+    if not path_value:
+        return default
+    candidate = Path(path_value)
+    if not candidate.is_absolute():
+        candidate = BASE_DIR / candidate
+    return candidate
 
 
 @dataclass
@@ -59,14 +83,30 @@ class CaseBrief:
 
 class CaseService:
     def __init__(self) -> None:
-        with CASE_PATH.open("r", encoding="utf-8") as f:
-            self.case_raw = json.load(f)
+        cfg = _load_config()
+        self.case_path = _resolve_path(cfg.get("case_path"), CASE_PATH)
+        self.matrix_path = _resolve_path(cfg.get("case_similarity_matrix_path"), MATRIX_PATH)
+
+        try:
+            with self.case_path.open("r", encoding="utf-8") as f:
+                self.case_raw = json.load(f)
+        except Exception as exc:
+            logger.warning(
+                "Failed to load case file %s (%s); falling back to default %s",
+                self.case_path,
+                exc,
+                CASE_PATH,
+            )
+            self.case_path = CASE_PATH
+            with CASE_PATH.open("r", encoding="utf-8") as f:
+                self.case_raw = json.load(f)
+
         self.case_ids = sorted(self.case_raw.keys())
         self.recommender: SequentialAdaptiveRecommender | None = None
         self.departments = self._extract_departments()
-        if MATRIX_PATH.exists():
-            matrix = np.load(MATRIX_PATH)
-            case_ids_sorted = load_case_ids(CASE_PATH)
+        if self.matrix_path.exists():
+            matrix = np.load(self.matrix_path)
+            case_ids_sorted = load_case_ids(self.case_path)
             # 仅当矩阵与case_id长度匹配时启用推荐
             if matrix.shape[0] == len(case_ids_sorted):
                 self.recommender = SequentialAdaptiveRecommender(matrix, case_ids_sorted)
@@ -483,12 +523,22 @@ class PBLInteractiveSession:
 
 
 class PBLSessionManager:
-    def __init__(self, pause_interval: float = 12.0, session_timeout_minutes: float = 30.0):
+    def __init__(
+        self,
+        pause_interval: float = 12.0,
+        session_timeout_minutes: float = 30.0,
+        completed_retention_minutes: float | None = None,
+    ):
         self.sessions: Dict[str, PBLInteractiveSession] = {}
         self.lock = threading.Lock()
         self.pause_interval = pause_interval
         self.session_timeout = max(60.0, float(session_timeout_minutes) * 60.0)
-        self.completed_retention = max(self.session_timeout, 300.0)
+        retention_sec = max(
+            self.session_timeout,
+            float(completed_retention_minutes or 0) * 60.0 if completed_retention_minutes else 0.0,
+            300.0,
+        )
+        self.completed_retention = retention_sec
         self._stop_cleaner = threading.Event()
         self._cleaner_thread = threading.Thread(target=self._cleaner_loop, daemon=True)
         self._cleaner_thread.start()
@@ -640,6 +690,7 @@ def _load_pause_interval() -> float:
 _SESSION_MANAGER = PBLSessionManager(
     pause_interval=_load_pause_interval(),
     session_timeout_minutes=_load_session_timeout_minutes(),
+    completed_retention_minutes=_load_completed_retention_minutes(),
 )
 
 

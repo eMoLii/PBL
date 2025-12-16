@@ -76,9 +76,41 @@ SPEECH_SPEED_DESCRIPTIONS = {
     7: "第7档 · 超极速",
 }
 
+SPEECH_SPEED_DESCRIPTIONS_EN = {
+    1: "Level 1 · Ultra slow",
+    2: "Level 2 · Slow",
+    3: "Level 3 · Slightly slow",
+    4: "Level 4 · Default",
+    5: "Level 5 · Slightly fast",
+    6: "Level 6 · Very fast",
+    7: "Level 7 · Ultra fast",
+}
+
 SESSION_COOKIE_NAME = "pbl_session_token"
 SESSION_COOKIE_DAYS = 30
 ADVANCED_OBJECTIVE_THRESHOLD = 0.5
+
+def _load_app_language() -> str:
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        lang = str(cfg.get("language", "zh")).lower()
+    except Exception:
+        lang = "zh"
+    return "en" if lang.startswith("en") else "zh"
+
+
+def _tr(zh: str, en: str) -> str:
+    lang = st.session_state.get("app_language") or _load_app_language()
+    st.session_state["app_language"] = lang
+    return en if lang == "en" else zh
+
+
+def _speed_description(level: int) -> str:
+    lang = st.session_state.get("app_language") or _load_app_language()
+    if lang == "en":
+        return SPEECH_SPEED_DESCRIPTIONS_EN.get(level, "Default speed")
+    return SPEECH_SPEED_DESCRIPTIONS.get(level, "默认速度")
 
 SURVEY_QUESTIONS = [
     "我对本次使用该 PBL 讨论系统的整体体验感到满意。",
@@ -96,6 +128,21 @@ SURVEY_QUESTIONS = [
 ]
 
 SURVEY_CHOICES = ["非常同意", "比较同意", "不确定", "比较不同意", "非常不同意"]
+SURVEY_QUESTIONS_EN = [
+    "I am satisfied with the overall experience of using this PBL discussion system.",
+    "The system helped me understand and master the clinical reasoning of this case.",
+    "I stayed engaged and actively participated in reasoning and decision-making.",
+    "I could express my views and steer my reasoning the way I wanted.",
+    "The virtual students prompted me to think deeper and participate more.",
+    "The teacher’s guidance/supervision made me feel supported and steered the discussion correctly.",
+    "When I was confused or off-topic, the system provided timely and effective guidance or correction.",
+    "After this discussion, I feel more confident in independently analyzing cases and forming diagnostic plans.",
+    "I am confident I can transfer the reasoning approach learned here to similar cases.",
+    "Completing my role in this system requires significant mental effort.",
+    "During discussion, I often felt the information load or steps were too complex to keep up.",
+    "The interface/prompts/virtual student interactions distracted me from key clinical cues.",
+]
+SURVEY_CHOICES_EN = ["Strongly agree", "Somewhat agree", "Neutral", "Somewhat disagree", "Strongly disagree"]
 
 
 def _current_speed_level() -> int:
@@ -122,7 +169,7 @@ def _apply_user_preferences(user_id: int) -> None:
     try:
         prefs = get_user_settings(user_id) or {}
     except Exception as exc:
-        st.warning(f"加载个性化设置失败：{exc}")
+        st.warning(_tr(f"加载个性化设置失败：{exc}", f"Failed to load preferences: {exc}"))
         return
     speed = prefs.get("speed_level")
     if isinstance(speed, int) and 1 <= speed <= 7:
@@ -156,7 +203,7 @@ def _persist_user_preferences(
         )
         return True
     except Exception as exc:
-        st.warning(f"保存个性化设置失败：{exc}")
+        st.warning(_tr(f"保存个性化设置失败：{exc}", f"Failed to save preferences: {exc}"))
         return False
 
 
@@ -268,7 +315,7 @@ def _save_active_session_state(force: bool = False, next_scene_index: Optional[i
         st.session_state["last_saved_log_len"] = len(log)
     except Exception as exc:
         if force:
-            st.warning(f"保存讨论进度失败：{exc}")
+            st.warning(_tr(f"保存讨论进度失败：{exc}", f"Failed to save progress: {exc}"))
 
 
 def _clear_active_session_record() -> None:
@@ -294,7 +341,7 @@ def _load_active_session_record() -> None:
     try:
         data = load_active_session_for_user(user["id"])
     except Exception as exc:
-        st.warning(f"加载未完成讨论失败：{exc}")
+        st.warning(_tr(f"加载未完成讨论失败：{exc}", f"Failed to load unfinished discussion: {exc}"))
         data = None
     if data:
         metadata = data.get("metadata") or {}
@@ -313,7 +360,7 @@ def _resume_saved_session(entry: Dict[str, Any]) -> None:
     case_id = entry.get("case_id")
     metadata = entry.get("metadata") or {}
     if not case_id:
-        st.warning("保存的讨论记录已失效。")
+        st.warning(_tr("保存的讨论记录已失效。", "Saved discussion is invalid."))
         _clear_active_session_record()
         return
     next_scene_index = int(metadata.get("next_scene_index", 0))
@@ -337,7 +384,7 @@ def _resume_saved_session(entry: Dict[str, Any]) -> None:
     )
     total_scenes = st.session_state.get("total_scenes") or len(st.session_state.get("scene_objective_keys") or [])
     if total_scenes and next_scene_index >= total_scenes:
-        st.info("该讨论已完成，无法继续。")
+        st.info(_tr("该讨论已完成，无法继续。", "This discussion is already finished and cannot be resumed."))
         _clear_active_session_record()
         st.session_state["page"] = "case_selection"
         st.rerun()
@@ -444,7 +491,7 @@ def _restore_user_from_cookie() -> None:
 def _render_speed_slider() -> None:
     default_level = _current_speed_level()
     level = st.slider(
-        "小组发言速度",
+        _tr("小组发言速度", "Group speaking speed"),
         min_value=1,
         max_value=7,
         value=default_level,
@@ -459,7 +506,7 @@ def _render_speed_slider() -> None:
                 st.session_state["persisted_speed_level"] = level
     else:
         st.session_state["persisted_speed_level"] = level
-    desc = SPEECH_SPEED_DESCRIPTIONS.get(level, "默认速度")
+    desc = _speed_description(level)
     st.caption(desc)
 
 
@@ -481,7 +528,7 @@ def _sync_speed_to_session(session_id: Optional[str]) -> None:
     try:
         set_session_speed(session_id, factor)
     except Exception as exc:
-        st.warning(f"同步发言速度失败：{exc}")
+        st.warning(_tr(f"同步发言速度失败：{exc}", f"Failed to sync speaking speed: {exc}"))
     else:
         st.session_state["speed_sync"] = {"session_id": session_id, "level": level}
 
@@ -782,10 +829,10 @@ def _resume_discussion(session_id: str | None) -> None:
 
 
 def render_login() -> None:
-    st.title("PBL 学习平台 - 登录")
-    username = st.text_input("账号", key="login_username")
-    password = st.text_input("密码", type="password", key="login_password")
-    if st.button("登录"):
+    st.title(_tr("PBL 学习平台 - 登录", "PBL Learning Platform - Sign In"))
+    username = st.text_input(_tr("账号", "Username"), key="login_username")
+    password = st.text_input(_tr("密码", "Password"), type="password", key="login_password")
+    if st.button(_tr("登录", "Sign In")):
         user = verify_user(username.strip(), password.strip()) if username and password else None
         if user:
             expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_COOKIE_DAYS)
@@ -795,14 +842,14 @@ def render_login() -> None:
                 st.session_state["session_token"] = token
                 _set_session_cookie(token, expires_at)
             except Exception as exc:
-                st.warning(f"创建会话失败：{exc}")
+                st.warning(_tr(f"创建会话失败：{exc}", f"Failed to create session: {exc}"))
             st.session_state["user"] = user
             _apply_user_preferences(user["id"])
             st.session_state["page"] = "case_selection"
-            st.success("登录成功！")
+            st.success(_tr("登录成功！", "Signed in successfully!"))
             st.rerun()
         else:
-            st.error("账号或密码错误，请重试。")
+            st.error(_tr("账号或密码错误，请重试。", "Invalid credentials, please try again."))
 
 
 def render_case_selection() -> None:
@@ -811,10 +858,10 @@ def render_case_selection() -> None:
         container = st.empty()
         st.session_state["case_selection_container"] = container
     with container.container():
-        st.title("选择案例开始学习")
+        st.title(_tr("选择案例开始学习", "Choose a case to start"))
         user = st.session_state.get("user")
         if not user:
-            st.warning("请先登录。")
+            st.warning(_tr("请先登录。", "Please sign in first."))
             st.session_state["page"] = "login"
             return
 
@@ -829,21 +876,30 @@ def render_case_selection() -> None:
             total_scenes_saved = metadata.get("total_scenes")
             if isinstance(total_scenes_saved, int) and total_scenes_saved > 0:
                 display_scene = min(next_idx + 1, total_scenes_saved)
-                scene_hint = f"（已讨论至场景 {display_scene}/{total_scenes_saved}）"
+                scene_hint = _tr(
+                    f"（已讨论至场景 {display_scene}/{total_scenes_saved}）",
+                    f"(Progress: scene {display_scene}/{total_scenes_saved})",
+                )
             else:
                 display_scene = next_idx + 1
-                scene_hint = f"（已讨论至场景 {display_scene}）" if next_idx else ""
+                scene_hint = _tr(
+                    f"（已讨论至场景 {display_scene}）",
+                    f"(Progress: scene {display_scene})",
+                ) if next_idx else ""
             st.info(
-                f"检测到未完成的讨论（案例 {saved_session.get('case_id')}）{scene_hint}，可继续或放弃。"
+                _tr(
+                    f"检测到未完成的讨论（案例 {saved_session.get('case_id')}）{scene_hint}，可继续或放弃。",
+                    f"Found an unfinished discussion (case {saved_session.get('case_id')}) {scene_hint}. You may resume or discard it.",
+                )
             )
             resume_col, discard_col = st.columns(2)
             with resume_col:
-                if st.button("继续上次讨论", key="resume_saved_session"):
+                if st.button(_tr("继续上次讨论", "Resume discussion"), key="resume_saved_session"):
                     _resume_saved_session(saved_session)
             with discard_col:
-                if st.button("放弃该讨论", key="discard_saved_session"):
+                if st.button(_tr("放弃该讨论", "Discard"), key="discard_saved_session"):
                     _clear_active_session_record()
-                    st.success("已放弃保存的讨论。")
+                    st.success(_tr("已放弃保存的讨论。", "Saved discussion discarded."))
                     st.rerun()
                     st.stop()
 
@@ -853,7 +909,7 @@ def render_case_selection() -> None:
         preferred_dept = st.session_state.get(dept_placeholder)
         if not history:
             selected_dept = st.selectbox(
-                "请选择你感兴趣的科室以开始学习",
+                _tr("请选择你感兴趣的科室以开始学习", "Choose a department to start"),
                 ["不限科室"] + department_options,
                 index=0 if not preferred_dept else (["不限科室"] + department_options).index(preferred_dept),
                 key="department_select_box",
@@ -863,47 +919,47 @@ def render_case_selection() -> None:
         else:
             preferred_dept = None
         recommended = case_service.recommend(history, top_k=3, department_filter=preferred_dept)
-        st.subheader("推荐案例")
+        st.subheader(_tr("推荐案例", "Recommended cases"))
         rec_cols = st.columns(len(recommended) or 1)
         for col, brief in zip(rec_cols, recommended):
             with col:
                 st.markdown(f"**{brief.case_id}**")
                 st.caption(brief.title[:80])
                 st.write(brief.summary[:120] + ("..." if len(brief.summary) > 120 else ""))
-                if st.button("选择此案例", key=f"rec_{brief.case_id}"):
+                if st.button(_tr("选择此案例", "Select this case"), key=f"rec_{brief.case_id}"):
                     start_case(brief.case_id)
                     st.rerun()
 
-        st.subheader("全部案例列表")
+        st.subheader(_tr("全部案例列表", "All cases"))
         others = case_service.remaining_cases([b.case_id for b in recommended])
         options = [b.case_id for b in others]
         case_map = {b.case_id: b for b in others}
         selected = st.selectbox(
-            "或从列表中选择其他案例",
+            _tr("或从列表中选择其他案例", "Or choose another case from the list"),
             options,
             format_func=lambda cid: f"{cid} - {case_map[cid].title[:40]}",
             key="manual_case_select",
         ) if options else None
-        if selected and st.button("选择此案例", key="start_manual_case"):
+        if selected and st.button(_tr("选择此案例", "Start this case"), key="start_manual_case"):
             start_case(selected)
             st.rerun()
 
-        st.subheader("最近学习记录")
+        st.subheader(_tr("最近学习记录", "Recent sessions"))
         if history:
             history_rows = [
                 {
-                    "案例": item["case_id"],
-                    "开始": _format_timestamp(item["started_at"]),
-                    "结束": _format_timestamp(item["ended_at"]),
-                    "前测": item["pre_score"],
-                    "后测": item["post_score"],
-                    "综合": item.get("composite_score"),
+                    _tr("案例", "Case"): item["case_id"],
+                    _tr("开始", "Start"): _format_timestamp(item["started_at"]),
+                    _tr("结束", "End"): _format_timestamp(item["ended_at"]),
+                    _tr("前测", "Pre-test"): item["pre_score"],
+                    _tr("后测", "Post-test"): item["post_score"],
+                    _tr("综合", "Overall"): item.get("composite_score"),
                 }
                 for item in history
             ]
             st.table(history_rows)
         else:
-            st.info("暂无历史记录，选择任意案例开始吧！")
+            st.info(_tr("暂无历史记录，选择任意案例开始吧！", "No history yet. Pick any case to begin!"))
 
 
 def render_test_page(kind: str) -> None:
@@ -912,7 +968,7 @@ def render_test_page(kind: str) -> None:
         st.session_state["page"] = "case_selection"
         st.rerun()
         return
-    st.title(f"{'前' if kind == 'pre' else '后'}测验 - {brief.case_id}")
+    st.title(_tr(f"{'前' if kind == 'pre' else '后'}测验 - {brief.case_id}", f"{'Pre' if kind == 'pre' else 'Post'} test - {brief.case_id}"))
     test_key = "pre_test_items" if kind == "pre" else "post_test_items"
     tests = st.session_state.get(test_key) or default_test_items(kind)
     answers_key = "pre_answers" if kind == "pre" else "post_answers"
@@ -920,8 +976,8 @@ def render_test_page(kind: str) -> None:
     for idx, item in enumerate(tests, start=1):
         qid = item.get("qid") or f"{kind}_{idx}"
         question_text = item.get("question", f"题目{idx}")
-        st.markdown(f"**题目{idx}：{question_text}**")
-        st.caption(f"{item.get('question_type', '题型未知')} | {item.get('exam_subject', '')}")
+        st.markdown(_tr(f"**题目{idx}：{question_text}**", f"**Question {idx}: {question_text}**"))
+        st.caption(_tr(f"{item.get('question_type', '题型未知')} | {item.get('exam_subject', '')}", f"{item.get('question_type', 'Unknown type')} | {item.get('exam_subject', '')}"))
         options = item.get("option")
         question_type = str(item.get("question_type", "")).lower()
         is_multi = "多" in question_type
@@ -943,13 +999,13 @@ def render_test_page(kind: str) -> None:
                 answers[qid] = new_selected
             else:
                 default_val = answers.get(qid)
-                option_entries = ["未选择"] + option_keys
+                option_entries = [_tr("未选择", "Not selected")] + option_keys
                 if default_val in option_keys:
                     default_entry = option_entries.index(default_val)
                 else:
                     default_entry = 0
                 selection = st.radio(
-                    f"选择题目{idx}",
+                    _tr(f"选择题目{idx}", f"Choose option for Q{idx}"),
                     option_entries,
                     index=default_entry,
                     format_func=lambda opt: format_func(opt) if opt in option_keys else opt,
@@ -958,13 +1014,13 @@ def render_test_page(kind: str) -> None:
                 answers[qid] = selection if selection in option_keys else ""
         else:
             response = st.text_input(
-                f"你的答案（题目{idx}）",
+                _tr(f"你的答案（题目{idx}）", f"Your answer (Q{idx})"),
                 value=answers.get(qid, ""),
                 key=f"{qid}_response",
             )
             answers[qid] = response
     st.session_state[answers_key] = answers
-    if st.button("提交测验", key=f"submit_{kind}_test"):
+    if st.button(_tr("提交测验", "Submit"), key=f"submit_{kind}_test"):
         tests_to_grade = st.session_state.get(test_key) or []
         missing = []
         for idx, item in enumerate(tests_to_grade, start=1):
@@ -981,7 +1037,7 @@ def render_test_page(kind: str) -> None:
                     if value not in options:
                         missing.append(idx)
         if missing:
-            st.warning(f"还有 {len(missing)} 道选择题未作答（题号：{', '.join(map(str, missing))}），请补充后再提交。")
+            st.warning(_tr(f"还有 {len(missing)} 道选择题未作答（题号：{', '.join(map(str, missing))}），请补充后再提交。", f"{len(missing)} multiple-choice questions are unanswered (Q: {', '.join(map(str, missing))}). Please complete them."))
             return
         score = score_test_items(tests_to_grade, answers)
         if kind == "pre":
@@ -1001,41 +1057,46 @@ def render_test_page(kind: str) -> None:
 
 
 def render_survey_page() -> None:
-    st.title("PBL 讨论体验调查问卷")
+    lang = st.session_state.get("app_language") or _load_app_language()
+    st.title(_tr("PBL 讨论体验调查问卷", "PBL Discussion Experience Survey"))
     st.write(
-        "请结合你在本系统中的学习体验，使用 5 分量表为以下陈述打分。"
-        "结果仅用于改进产品，不会影响你的成绩。"
+        _tr(
+            "请结合你在本系统中的学习体验，使用 5 分量表为以下陈述打分。结果仅用于改进产品，不会影响你的成绩。",
+            "Rate the statements below on a 5-point scale based on your experience. This is for improvement only and will not affect your score.",
+        )
     )
-    st.info("量表含义：非常同意 ＞ 比较同意 ＞ 不确定 ＞ 比较不同意 ＞ 非常不同意。")
+    st.info(_tr("量表含义：非常同意 ＞ 比较同意 ＞ 不确定 ＞ 比较不同意 ＞ 非常不同意。", "Scale: Strongly agree > Somewhat agree > Neutral > Somewhat disagree > Strongly disagree."))
     responses = st.session_state.setdefault("survey_answers", {})
-    for idx, question in enumerate(SURVEY_QUESTIONS, start=1):
+    questions = SURVEY_QUESTIONS_EN if lang == "en" else SURVEY_QUESTIONS
+    choices = SURVEY_CHOICES_EN if lang == "en" else SURVEY_CHOICES
+    for idx, question in enumerate(questions, start=1):
         qid = f"survey_q_{idx}"
-        default_choice = responses.get(qid, SURVEY_CHOICES[2])
+        default_choice = responses.get(qid, choices[2])
         st.markdown(f"**Q{idx}. {question}**")
         choice = st.radio(
             "",
-            SURVEY_CHOICES,
-            index=SURVEY_CHOICES.index(default_choice),
+            choices,
+            index=choices.index(default_choice),
             key=f"survey_radio_{idx}",
             horizontal=True,
             label_visibility="collapsed",
         )
         responses[qid] = choice
-        if idx < len(SURVEY_QUESTIONS):
+        if idx < len(questions):
             st.divider()
     user = st.session_state.get("user")
     case_id = st.session_state.get("selected_case_id")
-    if st.button("提交问卷", key="submit_survey", use_container_width=True):
+    if st.button(_tr("提交问卷", "Submit survey"), key="submit_survey", use_container_width=True):
         try:
             record_survey_response(
                 user_id=user["id"] if user else None,
                 case_id=case_id,
                 answers=responses,
             )
-            st.success("感谢填写，问卷已成功提交！")
+            st.success(_tr("感谢填写，问卷已成功提交！", "Thank you! Survey submitted."))
         except Exception as exc:
-            st.error(f"提交问卷失败：{exc}")
-    if st.button("返回推荐页面", use_container_width=True):
+            st.error(_tr(f"提交问卷失败：{exc}", f"Failed to submit survey: {exc}"))
+    if st.button(_tr("返回推荐页面", "Back to recommendation page"), use_container_width=True):
         st.session_state["page"] = "case_selection"
         st.rerun()
 
@@ -1061,11 +1122,12 @@ def _render_pbl_training_inner() -> None:
     status = session_state_data.get("status") if session_state_data else "idle"
     waiting_for_user = session_state_data.get("waiting_for_user") if session_state_data else False
     session_lost = st.session_state.get("session_lost", False)
-    st.title("PBL 讨论训练")
+    st.title(_tr("PBL 讨论训练", "PBL Discussion"))
     st.markdown(
-        "点击下方按钮即可与虚拟学习小组实时讨论。"
-        "系统会按顺序推送同伴发言，你可以随时发表观点！"
-        "每个场景结束后系统会自动保存当前进度。"
+        _tr(
+            "点击下方按钮即可与虚拟学习小组实时讨论。系统会按顺序推送同伴发言，你可以随时发表观点！每个场景结束后系统会自动保存当前进度。",
+            "Use the buttons below to start real-time discussion with virtual peers. Messages will flow in order; you can speak anytime. Progress is auto-saved after each scene.",
+        )
     )
     if st.session_state.pop("scroll_to_top_on_train", False):
         components.html("""
@@ -1076,8 +1138,8 @@ def _render_pbl_training_inner() -> None:
             </script>
         """, height=0)
     if session_lost and not session_state_data:
-        st.warning("检测到实时会话已断开，保存的讨论进度仍保留在右侧案例选项中，可返回案例选择页继续。")
-        go_back = st.button("返回案例选择并恢复讨论", key="return_to_cases_from_loss")
+        st.warning(_tr("检测到实时会话已断开，保存的讨论进度仍保留在右侧案例选项中，可返回案例选择页继续。", "Live session lost. Saved progress is available on the case selection page to resume."))
+        go_back = st.button(_tr("返回案例选择并恢复讨论", "Back to cases and resume"), key="return_to_cases_from_loss")
         if go_back:
             st.session_state["page"] = "case_selection"
             st.rerun()
@@ -1090,11 +1152,11 @@ def _render_pbl_training_inner() -> None:
     controls_col, skip_col = st.columns([1, 1], gap="small")
     with controls_col:
         start_disabled = status == "running" or bool(session_id)
-        button_label = "讨论进行中..." if session_id else "开始 PBL 讨论"
+        button_label = _tr("讨论进行中...", "Discussion running...") if session_id else _tr("开始 PBL 讨论", "Start PBL discussion")
         if st.button(button_label, key="run_pbl_agents", disabled=start_disabled):
             case_id = st.session_state.get("selected_case_id")
             if not case_id:
-                st.error("请先选择案例。")
+                st.error(_tr("请先选择案例。", "Please choose a case first."))
             else:
                 speed_factor = _current_speed_factor()
                 ability_window = _ability_window_from_pre_score(st.session_state.get("pre_score"))
@@ -1129,7 +1191,7 @@ def _render_pbl_training_inner() -> None:
     with skip_col:
         skip_disabled = not can_skip_to_post
         if st.button(
-            "结束 PBL 训练，进入后测验",
+            _tr("结束 PBL 训练，进入后测验", "End discussion and go to post-test"),
             key="to_post_test",
             disabled=skip_disabled,
             use_container_width=True,
@@ -1138,9 +1200,9 @@ def _render_pbl_training_inner() -> None:
             st.rerun()
 
     if status == "running":
-        st.info("学习小组正在协作，请稍候...")
+        st.info(_tr("学习小组正在协作，请稍候...", "The study group is working, please wait..."))
     if status == "error":
-        st.error(session_state_data.get("error", "讨论失败") if session_state_data else "讨论失败")
+        st.error(session_state_data.get("error", _tr("讨论失败", "Discussion failed")) if session_state_data else _tr("讨论失败", "Discussion failed"))
 
     if session_state_data:
         st.session_state["pbl_log"] = session_state_data.get("log", [])
@@ -1307,17 +1369,17 @@ def _render_pbl_training_inner() -> None:
         """,
         unsafe_allow_html=True,
     )
-    tab_labels = [f"场景 {idx + 1}" for idx in range(total_scenes)]
+    tab_labels = [_tr(f"场景 {idx + 1}", f"Scene {idx + 1}") for idx in range(total_scenes)]
     tabs = st.tabs(tab_labels)
     for idx, tab in enumerate(tabs):
         with tab:
             scene_entries = list(scene_groups.get(idx, []))
             if scene_entries:
-                st.subheader("讨论记录")
+                st.subheader(_tr("讨论记录", "Discussion log"))
                 for item in scene_entries:
                     speaker = item.get("speaker", "Unknown")
-                    label = "Student1（你）" if speaker == "Student1" else (speaker or "Unknown")
-                    content = _sanitize_content(item.get("content", "")) or "（无内容）"
+                    label = _tr("Student1（你）", "Student1 (You)") if speaker == "Student1" else (speaker or "Unknown")
+                    content = _sanitize_content(item.get("content", "")) or _tr("（无内容）", "(No content)")
                     timestamp = item.get("timestamp")
                     role, avatar = _chat_role_and_avatar(speaker)
                     chat_kwargs = {"avatar": avatar} if avatar else {}
@@ -1334,7 +1396,7 @@ def _render_pbl_training_inner() -> None:
                             st.caption(caption_label)
                         st.markdown(content)
             else:
-                st.info("尚未生成讨论记录。")
+                st.info(_tr("尚未生成讨论记录。", "No discussion log yet."))
 
     pending_tab = st.session_state.pop("pending_tab_click", None)
     if pending_tab is not None and 0 <= pending_tab < len(tab_labels):
@@ -1372,52 +1434,55 @@ def _render_pbl_training_inner() -> None:
             st.session_state["teacher_reply_pending"] = True
     if session_id and waiting_for_user:
         if waiting_next_scene or manual_pause_active or not allow_input:
-            chat_placeholder = "讨论已暂停，请点击“继续讨论”后再发言"
+            chat_placeholder = _tr("讨论已暂停，请点击“继续讨论”后再发言", "Discussion paused. Click 'Resume discussion' to speak.")
         elif teacher_reply_pending_flag or awaiting_teacher_flag:
-            chat_placeholder = "教师评估讨论中，请稍等~"
+            chat_placeholder = _tr("教师评估讨论中，请稍等~", "Teacher is reviewing. Please wait.")
         else:
-            chat_placeholder = "输入你的观点、总结或疑问…"
+            chat_placeholder = _tr("输入你的观点、总结或疑问…", "Enter your opinion, summary, or question…")
     elif session_id:
-        chat_placeholder = "请点击“我要发言”按钮开始发言！"
+        chat_placeholder = _tr("请点击“我要发言”按钮开始发言！", "Click 'I want to speak' to start talking!")
     else:
-        chat_placeholder = "开始讨论后即可发言"
+        chat_placeholder = _tr("开始讨论后即可发言", "You can speak after starting the discussion")
 
     resume_button_show = False
     resume_button_disabled = False
     if not session_id:
-        st.info("尚未开始 PBL 讨论。")
+        st.info(_tr("尚未开始 PBL 讨论。", "PBL discussion not started yet."))
     elif all_scenes_completed:
-        st.success("全部场景讨论已结束，请完成后测验。")
+        st.success(_tr("全部场景讨论已结束，请完成后测验。", "All scenes finished. Please complete the post-test."))
     elif waiting_next_scene:
         current_scene_number = (latest_completed_scene + 1) if latest_completed_scene >= 0 else 1
         next_scene_number = min(current_scene_number + 1, total_scenes)
         st.info(
-            f"场景{current_scene_number}结束，请切换至场景{next_scene_number}继续讨论！"
+            _tr(
+                f"场景{current_scene_number}结束，请切换至场景{next_scene_number}继续讨论！",
+                f"Scene {current_scene_number} ended. Switch to scene {next_scene_number} to continue.",
+            )
         )
         resume_button_disabled = cooldown_remaining > 0
         resume_button_show = True
     elif waiting_for_user:
         if manual_pause_active or (not allow_input):
-            st.info("讨论暂停中，请点击“继续讨论”恢复。")
+            st.info(_tr("讨论暂停中，请点击“继续讨论”恢复。", "Discussion paused. Click 'Resume discussion' to continue."))
             resume_button_show = True
             resume_button_disabled = False
         else:
             if teacher_reply_pending_flag or awaiting_teacher_flag:
-                st.info("教师评估讨论中，请稍等~")
+                st.info(_tr("教师评估讨论中，请稍等~", "Teacher is reviewing. Please wait."))
             else:
-                st.success("轮到你发言了，请通过下方输入框发送观点。")
+                st.success(_tr("轮到你发言了，请通过下方输入框发送观点。", "It's your turn. Share your thoughts below."))
     else:
         if summary_invite:
-            st.info("老师正在等你进行总结反思，请点击“我要发言”开始总结。")
+            st.info(_tr("老师正在等你进行总结反思，请点击“我要发言”开始总结。", "Teacher is waiting for your summary. Click 'I want to speak' to start."))
         pending_controls = teacher_reply_pending_flag or awaiting_teacher_flag
         disable_request = (status == "running" and not teacher_started) or pending_controls
         if pending_controls:
-            st.info("教师评估讨论中，请稍等~")
+            st.info(_tr("教师评估讨论中，请稍等~", "Teacher is reviewing. Please wait."))
         else:
             speak_col, pause_col = st.columns([1, 1], gap="small")
             with speak_col:
                 if st.button(
-                    "我要发言",
+                    _tr("我要发言", "I want to speak"),
                     key="request_speak",
                     disabled=disable_request,
                     use_container_width=True,
@@ -1426,7 +1491,7 @@ def _render_pbl_training_inner() -> None:
                     st.rerun()
             with pause_col:
                 if st.button(
-                    "暂停讨论",
+                    _tr("暂停讨论", "Pause discussion"),
                     key="pause_discussion",
                     disabled=disable_request,
                     use_container_width=True,
@@ -1454,7 +1519,7 @@ def _render_pbl_training_inner() -> None:
         and not manual_pause_active
         and user_chat_input is not None
     ):
-        message_text = user_chat_input.strip() or "（学生暂不发言）"
+        message_text = user_chat_input.strip() or _tr("（学生暂不发言）", "(No input)")
         normalized = message_text.rstrip()
         lower_norm = normalized.lower()
         if current_stage_label == "summary" and "<call_teacher>" not in lower_norm:
@@ -1474,7 +1539,7 @@ def _render_pbl_training_inner() -> None:
     elif resume_button_show:
         with resume_button_placeholder:
             if st.button(
-                "继续讨论",
+                _tr("继续讨论", "Resume discussion"),
                 key="resume_discussion",
                 use_container_width=True,
                 disabled=resume_button_disabled,
@@ -1528,13 +1593,13 @@ def render_evaluation_page() -> None:
     st.session_state["evaluation_result"] = evaluation
     st.session_state["advice_result"] = advice
 
-    st.title("自动化评估")
-    st.subheader("测验成绩概览")
+    st.title(_tr("自动化评估", "Automated Evaluation"))
+    st.subheader(_tr("测验成绩概览", "Test Score Overview"))
     delta_score = post_score - pre_score
     col1, col2, col3 = st.columns(3)
-    col1.metric("前测得分", f"{pre_score:.0f}")
-    col2.metric("后测得分", f"{post_score:.0f}", f"{delta_score:+.0f}")
-    col3.metric("分数变化", f"{delta_score:+.0f}")
+    col1.metric(_tr("前测得分", "Pre-test"), f"{pre_score:.0f}")
+    col2.metric(_tr("后测得分", "Post-test"), f"{post_score:.0f}", f"{delta_score:+.0f}")
+    col3.metric(_tr("分数变化", "Score change"), f"{delta_score:+.0f}")
 
     def _normalize_choice_codes(value: Any) -> List[str]:
         if value is None:
@@ -1554,71 +1619,71 @@ def render_evaluation_page() -> None:
             return False
         return user_codes == expected
 
-    st.subheader("测验参考答案")
+    st.subheader(_tr("测验参考答案", "Test answers"))
     pre_tests = st.session_state.get("pre_test_items") or default_test_items("pre")
     post_tests = st.session_state.get("post_test_items") or default_test_items("post")
     pre_answers = st.session_state.get("pre_answers", {})
     post_answers = st.session_state.get("post_answers", {})
     pre_report_lines: List[str] = []
     post_report_lines: List[str] = []
-    with st.expander("前测答疑", expanded=False):
+    with st.expander(_tr("前测答疑", "Pre-test review"), expanded=False):
         if not pre_tests:
-            st.write("暂无前测题目。")
-            pre_report_lines.append("前测：无题目。")
+            st.write(_tr("暂无前测题目。", "No pre-test questions."))
+            pre_report_lines.append(_tr("前测：无题目。", "Pre-test: no questions."))
         else:
-            pre_report_lines.append("前测：")
+            pre_report_lines.append(_tr("前测：", "Pre-test:"))
             for idx, item in enumerate(pre_tests, start=1):
-                correct = item.get("answer", "（参考答案待补充）")
+                correct = item.get("answer", _tr("（参考答案待补充）", "(Reference answer TBD)"))
                 qid = item.get("qid") or f"pre_{idx}"
                 raw_val = pre_answers.get(qid)
                 if isinstance(raw_val, list):
-                    user_val = "、".join(raw_val) if raw_val else "（未作答）"
+                    user_val = "、".join(raw_val) if raw_val else _tr("（未作答）", "(Not answered)")
                 else:
-                    user_val = raw_val or "（未作答）"
+                    user_val = raw_val or _tr("（未作答）", "(Not answered)")
                 correct_flag = _is_answer_correct(correct, raw_val)
                 prefix_icon = "✅" if correct_flag else ("❌" if correct_flag is False else "ℹ️")
-                status_text = "正确" if correct_flag else ("错误" if correct_flag is False else "未判定")
-                st.markdown(f"{prefix_icon} **题目{idx}：{item.get('question', '')}**")
+                status_text = _tr("正确", "Correct") if correct_flag else (_tr("错误", "Incorrect") if correct_flag is False else _tr("未判定", "Not judged"))
+                st.markdown(_tr(f"{prefix_icon} **题目{idx}：{item.get('question', '')}**", f"{prefix_icon} **Q{idx}: {item.get('question', '')}**"))
                 options = item.get("option") or {}
                 if isinstance(options, dict) and options:
                     for key in sorted(options.keys()):
                         st.markdown(f"- {key}. {options[key]}")
-                st.markdown(f"- 你的答案：{user_val}")
-                st.markdown(f"- 参考答案：{correct}")
+                st.markdown(_tr(f"- 你的答案：{user_val}", f"- Your answer: {user_val}"))
+                st.markdown(_tr(f"- 参考答案：{correct}", f"- Correct answer: {correct}"))
                 pre_report_lines.append(
                     f"  - 题目{idx}（{status_text}）：{item.get('question','')} | 你的答案：{user_val} | 参考：{correct}"
                 )
-    with st.expander("后测答疑", expanded=False):
+    with st.expander(_tr("后测答疑", "Post-test review"), expanded=False):
         if not post_tests:
-            st.write("暂无后测题目。")
-            post_report_lines.append("后测：无题目。")
+            st.write(_tr("暂无后测题目。", "No post-test questions."))
+            post_report_lines.append(_tr("后测：无题目。", "Post-test: no questions."))
         else:
-            post_report_lines.append("后测：")
+            post_report_lines.append(_tr("后测：", "Post-test:"))
             for idx, item in enumerate(post_tests, start=1):
-                correct = item.get("answer", "（参考答案待补充）")
+                correct = item.get("answer", _tr("（参考答案待补充）", "(Reference answer TBD)"))
                 qid = item.get("qid") or f"post_{idx}"
                 raw_val = post_answers.get(qid)
                 if isinstance(raw_val, list):
-                    user_val = "、".join(raw_val) if raw_val else "（未作答）"
+                    user_val = "、".join(raw_val) if raw_val else _tr("（未作答）", "(Not answered)")
                 else:
-                    user_val = raw_val or "（未作答）"
+                    user_val = raw_val or _tr("（未作答）", "(Not answered)")
                 correct_flag = _is_answer_correct(correct, raw_val)
                 prefix_icon = "✅" if correct_flag else ("❌" if correct_flag is False else "ℹ️")
-                status_text = "正确" if correct_flag else ("错误" if correct_flag is False else "未判定")
-                st.markdown(f"{prefix_icon} **题目{idx}：{item.get('question', '')}**")
+                status_text = _tr("正确", "Correct") if correct_flag else (_tr("错误", "Incorrect") if correct_flag is False else _tr("未判定", "Not judged"))
+                st.markdown(_tr(f"{prefix_icon} **题目{idx}：{item.get('question', '')}**", f"{prefix_icon} **Q{idx}: {item.get('question', '')}**"))
                 options = item.get("option") or {}
                 if isinstance(options, dict) and options:
                     for key in sorted(options.keys()):
                         st.markdown(f"- {key}. {options[key]}")
-                st.markdown(f"- 你的答案：{user_val}")
-                st.markdown(f"- 参考答案：{correct}")
+                st.markdown(_tr(f"- 你的答案：{user_val}", f"- Your answer: {user_val}"))
+                st.markdown(_tr(f"- 参考答案：{correct}", f"- Correct answer: {correct}"))
                 post_report_lines.append(
                     f"  - 题目{idx}（{status_text}）：{item.get('question','')} | 你的答案：{user_val} | 参考：{correct}"
                 )
     if not pre_report_lines:
-        pre_report_lines.append("前测：无数据。")
+        pre_report_lines.append(_tr("前测：无数据。", "Pre-test: no data."))
     if not post_report_lines:
-        post_report_lines.append("后测：无数据。")
+        post_report_lines.append(_tr("后测：无数据。", "Post-test: no data."))
     test_report_text = "\n".join(pre_report_lines + [""] + post_report_lines)
     advice_ready = advice is not None
     if (
@@ -1643,28 +1708,28 @@ def render_evaluation_page() -> None:
                 st.session_state["advice_enhanced"] = True
                 advice_ready = True
         except Exception as exc:
-            st.warning(f"更新学习建议失败：{exc}")
+            st.warning(_tr(f"更新学习建议失败：{exc}", f"Failed to refresh advice: {exc}"))
     if not evaluation or not isinstance(evaluation.get("dimensions"), dict):
-        st.info("讨论评估尚未完成，请稍候…")
+        st.info(_tr("讨论评估尚未完成，请稍候…", "Evaluation not ready yet, please wait…"))
         time.sleep(2.0)
         st.rerun()
         return
 
-    st.subheader("PBL讨论各维度得分")
+    st.subheader(_tr("PBL讨论各维度得分", "PBL Dimension Scores"))
     for dim in evaluation["dimensions"].values():
-        st.markdown(f"- **{dim['title']}**：{dim['score']} 分（{dim['justification']}）")
+        st.markdown(_tr(f"- **{dim['title']}**：{dim['score']} 分（{dim['justification']}）", f"- **{dim['title']}**: {dim['score']} ({dim['justification']})"))
 
-    st.subheader("学习建议")
+    st.subheader(_tr("学习建议", "Learning Advice"))
     if not advice_ready:
-        st.info("学习建议生成中，请稍候…")
+        st.info(_tr("学习建议生成中，请稍候…", "Generating advice, please wait…"))
         time.sleep(2.0)
         st.rerun()
         return
     st.write(advice["general_advice"].get("summary", ""))
-    st.markdown("**推荐资源：**")
+    st.markdown(_tr("**推荐资源：**", "**Recommended resources:**"))
     for res in advice["general_advice"].get("recommended_resources", []):
         st.markdown(f"- {res}")
-    st.markdown("**细化建议：**")
+    st.markdown(_tr("**细化建议：**", "**Detailed advice:**"))
     for item in advice.get("detailed_advice", []):
         st.markdown(f"- [{item['dimension']}] {item['issue']} | {item['suggestion']}")
 
@@ -1688,14 +1753,14 @@ def render_evaluation_page() -> None:
             )
             st.session_state["session_saved"] = True
 
-    if st.button("返回案例选择，开始下一个案例", key="back_to_cases"):
+    if st.button(_tr("返回案例选择，开始下一个案例", "Back to case selection for next case"), key="back_to_cases"):
         reset_case_state()
         st.session_state["page"] = "case_selection"
         st.rerun()
 
 
 def main() -> None:
-    st.set_page_config(page_title="PBL 学习系统", layout="wide")
+    st.set_page_config(page_title=_tr("PBL 学习系统", "PBL Learning System"), layout="wide")
     init_db()
     seed_users(None)
     initialize_app_state()
@@ -1707,19 +1772,19 @@ def main() -> None:
     with st.sidebar:
         user = st.session_state.get("user")
         if user:
-            st.caption(f"当前用户：{user['username']}")
-            if st.button("退出登录"):
+            st.caption(_tr(f"当前用户：{user['username']}", f"User: {user['username']}"))
+            if st.button(_tr("退出登录", "Sign out")):
                 _handle_logout()
                 st.rerun()
         else:
-            st.caption("请先登录以体验 PBL 训练。")
+            st.caption(_tr("请先登录以体验 PBL 训练。", "Please sign in to use the PBL trainer."))
         st.markdown("---")
         _render_speed_slider()
         page_state = st.session_state.get("page", "login")
         students_locked = (page_state == "pbl_training")
         current_count = int(st.session_state.get("desired_students_count", 5))
         new_count = st.slider(
-            "PBL 小组人数",
+            _tr("PBL 小组人数", "PBL group size"),
             min_value=4,
             max_value=8,
             value=current_count,
@@ -1737,7 +1802,7 @@ def main() -> None:
             else:
                 st.session_state["persisted_student_count"] = new_count
         if students_locked:
-            st.caption("讨论进行中，人数设置暂不可调整。")
+            st.caption(_tr("讨论进行中，人数设置暂不可调整。", "Group size is locked during discussion."))
 
         if user:
             profile_cache = st.session_state.get("user_profile_cache")
@@ -1746,47 +1811,54 @@ def main() -> None:
                 try:
                     data = get_user_profile(user["id"]) or {}
                 except Exception as exc:
-                    st.warning(f"加载基本信息失败：{exc}")
+                    st.warning(_tr(f"加载基本信息失败：{exc}", f"Failed to load profile: {exc}"))
                     data = {}
                 profile_cache = {"user_id": user["id"], **data}
                 st.session_state["user_profile_cache"] = profile_cache
                 profile_reset = True
-            st.markdown("### 基本信息")
-            gender_options = ["未填写", "男", "女"]
+            st.markdown(_tr("### 基本信息", "### Basic info"))
+            gender_options = [_tr("未填写", "Not set"), _tr("男", "Male"), _tr("女", "Female")]
+            stored_gender = (profile_cache.get("gender") or "").strip()
+            if stored_gender in ("男", "Male"):
+                default_gender = gender_options[1]
+            elif stored_gender in ("女", "Female"):
+                default_gender = gender_options[2]
+            else:
+                default_gender = gender_options[0]
             gender_value = st.selectbox(
-                "性别",
+                _tr("性别", "Gender"),
                 gender_options,
-                index=gender_options.index((profile_cache.get("gender") or "未填写")),
+                index=gender_options.index(default_gender),
                 key="profile_gender",
             )
             age_value = st.number_input(
-                "年龄",
+                _tr("年龄", "Age"),
                 min_value=0,
                 max_value=120,
                 step=1,
                 value=int(profile_cache.get("age") or 0),
                 key="profile_age",
             )
-            if st.button("保存基本信息", use_container_width=True):
+            if st.button(_tr("保存基本信息", "Save profile"), use_container_width=True):
                 try:
                     upsert_user_profile(
                         user_id=user["id"],
-                        gender=gender_value if gender_value != "未填写" else None,
+                        gender=gender_value if gender_value != _tr("未填写", "Not set") else None,
                         age=int(age_value) if age_value > 0 else None,
                     )
-                    st.success("已保存基本信息。")
+                    st.success(_tr("已保存基本信息。", "Profile saved."))
                     st.session_state["user_profile_cache"] = {
                         "user_id": user["id"],
-                        "gender": gender_value if gender_value != "未填写" else None,
+                        "gender": gender_value if gender_value != _tr("未填写", "Not set") else None,
                         "age": int(age_value) if age_value > 0 else None,
                     }
                 except Exception as exc:
-                    st.error(f"保存失败：{exc}")
+                    st.error(_tr(f"保存失败：{exc}", f"Failed to save: {exc}"))
 
         st.markdown("---")
         allow_survey = page_state in {"case_selection", "evaluation"}
         if st.button(
-            "填写调查问卷",
+            _tr("填写调查问卷", "Fill survey"),
             key="sidebar_survey_button",
             use_container_width=True,
             disabled=not allow_survey,
@@ -1794,39 +1866,39 @@ def main() -> None:
             st.session_state["page"] = "survey"
             st.rerun()
         if not allow_survey:
-            st.caption("问卷仅可在推荐或评估页面填写。")
+            st.caption(_tr("问卷仅可在推荐或评估页面填写。", "Survey available only on recommendation or evaluation pages."))
 
-        st.markdown("### 意见与建议")
+        st.markdown(_tr("### 意见与建议", "### Feedback"))
         suggestion_disabled = user is None
         if st.session_state.pop("sidebar_feedback_reset", False):
             st.session_state["sidebar_feedback_text"] = ""
         suggestion = st.text_area(
-            "欢迎随时提出改进建议",
+            _tr("欢迎随时提出改进建议", "Share your feedback anytime"),
             value=st.session_state.get("sidebar_feedback_text", ""),
             key="sidebar_feedback_text",
             height=120,
             disabled=suggestion_disabled,
         )
         if st.button(
-            "提交反馈",
+            _tr("提交反馈", "Submit feedback"),
             key="sidebar_submit_feedback",
             use_container_width=True,
             disabled=suggestion_disabled,
         ):
             content = (suggestion or "").strip()
             if not content:
-                st.warning("请先填写建议内容。")
+                st.warning(_tr("请先填写建议内容。", "Please enter your feedback first."))
             else:
                 try:
                     if user:
                         record_feedback(user["id"], content)
-                        st.success("感谢反馈！")
+                        st.success(_tr("感谢反馈！", "Thanks for your feedback!"))
                         st.session_state["sidebar_feedback_reset"] = True
                         st.rerun()
                     else:
-                        st.warning("请先登录后再提交建议。")
+                        st.warning(_tr("请先登录后再提交建议。", "Please sign in before submitting feedback."))
                 except Exception as exc:
-                    st.error(f"提交失败：{exc}")
+                    st.error(_tr(f"提交失败：{exc}", f"Submission failed: {exc}"))
 
     page = st.session_state.get("page", "login")
     if not st.session_state.get("user") and page != "login":
