@@ -1198,8 +1198,8 @@ def _render_pbl_training_inner() -> None:
     last_forced_total = st.session_state.get("last_force_speak_total", 0)
     need_force = (
         session_id
-        and total_student_messages > (2 * students_total)
-        and current_seen < (total_student_messages / (2.0 * students_total))
+        and total_student_messages > (1.5 * students_total)
+        and current_seen < (total_student_messages / (1.5 * students_total))
         and not waiting_for_user
     )
     if need_force and total_student_messages > last_forced_total:

@@ -98,10 +98,20 @@ class CaseService:
 
     def recommend(self, history: Sequence[Dict[str, Any]], top_k: int = 3, *, department_filter: str | None = None) -> List[CaseBrief]:
         dept_clean = (department_filter or "").strip()
+
+        def _prioritize_case_82(ids: List[str]) -> List[str]:
+            # 冷启动且不限科室时，将 case_82 置顶
+            if dept_clean:
+                return ids
+            if "case_82" not in ids:
+                return ids
+            return ["case_82"] + [cid for cid in ids if cid != "case_82"]
+
         if (not history) or (not self.recommender):
             eligible = [cid for cid in self.case_ids if not dept_clean or self.departments.get(cid) == dept_clean]
             if not eligible:
                 eligible = list(self.case_ids)
+            eligible = _prioritize_case_82(eligible)
             selected = eligible[:top_k]
             return [self.to_brief(cid) for cid in selected]
         hist_ids = []
@@ -122,6 +132,7 @@ class CaseService:
             eligible = [cid for cid in self.case_ids if not dept_clean or self.departments.get(cid) == dept_clean]
             if not eligible:
                 eligible = list(self.case_ids)
+            eligible = _prioritize_case_82(eligible)
             return [self.to_brief(cid) for cid in eligible[:top_k]]
         try:
             recs = self.recommender.recommend(hist_ids, scores, top_k=top_k)
