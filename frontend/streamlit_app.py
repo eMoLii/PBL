@@ -53,6 +53,7 @@ from backend.services import (  # noqa: E402
     resume_user_turn,
     set_session_speed,
     refresh_advice_with_tests,
+    finalize_session_scores,
     score_test_items,
     save_active_session_for_user,
     load_active_session_for_user,
@@ -1100,6 +1101,13 @@ def render_test_page(kind: str) -> None:
                 reset_case_state()
                 st.session_state["page"] = "case_selection"
             else:
+                session_id = st.session_state.get("pbl_session_id")
+                if session_id:
+                    try:
+                        finalize_session_scores(session_id, float(st.session_state["pre_score"]), float(score))
+                        st.session_state["session_saved"] = True
+                    except Exception as exc:
+                        logger.warning("后测分数上报失败：%s", exc)
                 st.session_state["page"] = "evaluation"
         st.rerun()
 

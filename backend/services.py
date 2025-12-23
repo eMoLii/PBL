@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
@@ -267,6 +268,10 @@ class PBLInteractiveSession:
         self.stop_event = threading.Event()
         self.stop_requested = False
         self.completed_at: float | None = None
+        self.started_at: str = datetime.now(timezone.utc).isoformat()
+        self.pre_score: float | None = None
+        self.post_score: float | None = None
+        self.persisted: bool = False
 
     def start(self) -> None:
         self.status = "running"
@@ -354,6 +359,7 @@ class PBLInteractiveSession:
             self.waiting_for_user = False
             if self.is_finished():
                 self.completed_at = time.time()
+                self._persist_if_ready()
 
     def refresh_advice_with_tests(
         self,
@@ -387,7 +393,47 @@ class PBLInteractiveSession:
                 json.dumps(advice, ensure_ascii=False, indent=2),
             )
         self.touch()
+        self._persist_if_ready()
         return advice
+
+    def finalize_scores(self, pre_score: float, post_score: float) -> None:
+        with self.state_lock:
+            self.pre_score = float(pre_score)
+            self.post_score = float(post_score)
+        self._persist_if_ready()
+
+    def _persist_if_ready(self) -> None:
+        """在评估/建议和分数齐备时写入学习记录，防止前端中途关闭导致漏写。"""
+        if self.persisted:
+            return
+        with self.state_lock:
+            if self.persisted:
+                return
+            if (
+                self.owner_user_id is None
+                or self.evaluation is None
+                or self.advice is None
+                or self.pre_score is None
+                or self.post_score is None
+            ):
+                return
+            payload = {
+                "user_id": self.owner_user_id,
+                "case_id": self.case_id,
+                "started_at": self.started_at,
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+                "pre_score": self.pre_score,
+                "post_score": self.post_score,
+                "evaluation": self.evaluation,
+                "advice": self.advice,
+            }
+            self.persisted = True
+        try:
+            record_study_session(**payload)
+        except Exception as exc:
+            logger.error("Failed to persist study session for %s: %s", self.case_id, exc)
+            with self.state_lock:
+                self.persisted = False
 
     def _on_message(self, payload: Dict[str, Any]) -> None:
         speaker = payload.get("speaker")
@@ -656,6 +702,14 @@ class PBLSessionManager:
             raise KeyError("session not found")
         return session.refresh_advice_with_tests(pre_score, post_score, test_report)
 
+    def finalize_scores(self, session_id: str, pre_score: float, post_score: float) -> None:
+        """记录测验分数并尝试持久化，防止前端关闭导致漏写。"""
+        self._cleanup_expired_sessions()
+        session = self.sessions.get(session_id)
+        if not session:
+            raise KeyError("session not found")
+        session.finalize_scores(pre_score, post_score)
+
 
 def _load_pause_interval() -> float:
     try:
@@ -739,6 +793,14 @@ def refresh_advice_with_tests(
     test_report: str | None = None,
 ) -> Dict[str, Any] | None:
     return _SESSION_MANAGER.refresh_advice(session_id, pre_score, post_score, test_report)
+
+
+def finalize_session_scores(
+    session_id: str,
+    pre_score: float,
+    post_score: float,
+) -> None:
+    _SESSION_MANAGER.finalize_scores(session_id, pre_score, post_score)
 
 
 def save_active_session_for_user(
