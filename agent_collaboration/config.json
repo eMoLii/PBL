@@ -28,7 +28,7 @@
   "evaluation_max_context_chars": 3200,
   "activeness_sigmoid_a": 3.0,
   "advisor_max_transcript_chars": 30000,
-  "session_timeout_minutes": 30,
+  "session_timeout_minutes": 0.01,
   "exam_only_users": [
     "user101",
     "user102",

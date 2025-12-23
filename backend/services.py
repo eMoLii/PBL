@@ -118,7 +118,8 @@ class CaseService:
                 return ids
             return ["case_82"] + [cid for cid in ids if cid != "case_82"]
 
-        if (not history) or (not self.recommender):
+        # 仅在推荐器缺失且历史为空时使用冷启动逻辑；否则先收集历史后再过滤
+        if (not history) and (not self.recommender):
             eligible = [cid for cid in self.case_ids if not dept_clean or self.departments.get(cid) == dept_clean]
             if not eligible:
                 eligible = list(self.case_ids)
@@ -139,30 +140,35 @@ class CaseService:
                 or 60.0
             )
             scores.append(max(0.0, min(5.0, float(score) / 20.0)))
+        history_set = set(hist_ids)
         if not hist_ids:
-            eligible = [cid for cid in self.case_ids if not dept_clean or self.departments.get(cid) == dept_clean]
+            eligible = [cid for cid in self.case_ids if cid not in history_set and (not dept_clean or self.departments.get(cid) == dept_clean)]
             if not eligible:
-                eligible = list(self.case_ids)
+                eligible = [cid for cid in self.case_ids if cid not in history_set] or list(self.case_ids)
             eligible = _prioritize_case_82(eligible)
             return [self.to_brief(cid) for cid in eligible[:top_k]]
         try:
             recs = self.recommender.recommend(hist_ids, scores, top_k=top_k)
             final = []
             for rec in recs:
+                if rec.case_id in history_set:
+                    continue
                 if dept_clean and self.departments.get(rec.case_id) != dept_clean:
                     continue
                 final.append(self.to_brief(rec.case_id))
                 if len(final) >= top_k:
                     break
             if len(final) < top_k:
-                remaining = [cid for cid in self.case_ids if (not dept_clean or self.departments.get(cid) == dept_clean) and cid not in hist_ids]
+                remaining = [cid for cid in self.case_ids if (cid not in history_set) and (not dept_clean or self.departments.get(cid) == dept_clean)]
                 for cid in remaining:
                     final.append(self.to_brief(cid))
                     if len(final) >= top_k:
                         break
             return final
         except Exception:
-            return [self.to_brief(cid) for cid in self.case_ids[:top_k]]
+            fallback = [cid for cid in self.case_ids if cid not in history_set]
+            fallback = _prioritize_case_82(fallback)
+            return [self.to_brief(cid) for cid in fallback[:top_k]]
 
     def remaining_cases(self, exclude: Sequence[str]) -> List[CaseBrief]:
         excl = set(exclude)
