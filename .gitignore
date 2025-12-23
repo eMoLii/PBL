@@ -10,4 +10,4 @@ requirements.txt
 
 nohup.out
 
-pbl.db
+backend/data/pbl.db
