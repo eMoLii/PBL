@@ -10,6 +10,7 @@ import math
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import logging
 import streamlit.components.v1 as components
 import streamlit as st
 
@@ -17,6 +18,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 CONFIG_PATH = REPO_ROOT / "agent_collaboration" / "config.json"
+
+logger = logging.getLogger("pbl.frontend")
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
 
 from backend.database import (  # noqa: E402
     fetch_user_history,
@@ -116,6 +121,38 @@ def _load_default_students_count() -> int:
         return int(data.get("students_count", 5))
     except Exception:
         return 5
+
+
+def _load_exam_only_users() -> set[str]:
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("exam_only_users") or []
+        return {str(u).strip().lower() for u in raw if str(u).strip()}
+    except Exception:
+        return set()
+
+
+EXAM_ONLY_USERS = _load_exam_only_users()
+
+
+def _load_debug_mode() -> bool:
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return bool(data.get("debug", False))
+    except Exception:
+        return False
+
+
+DEBUG_MODE = _load_debug_mode()
+
+
+def _is_exam_only_user(user: Optional[Dict[str, Any]]) -> bool:
+    if not user:
+        return False
+    username = str(user.get("username") or "").strip().lower()
+    return bool(username and username in EXAM_ONLY_USERS)
 
 
 def _apply_user_preferences(user_id: int) -> None:
@@ -290,6 +327,10 @@ def _load_active_session_record() -> None:
     user = st.session_state.get("user")
     if not user or st.session_state.get("active_session_checked"):
         return
+    if st.session_state.get("is_exam_only"):
+        st.session_state["pending_active_session"] = None
+        st.session_state["active_session_checked"] = True
+        return
     st.session_state["active_session_checked"] = True
     try:
         data = load_active_session_for_user(user["id"])
@@ -436,6 +477,7 @@ def _restore_user_from_cookie() -> None:
     if user:
         st.session_state["user"] = user
         st.session_state["session_token"] = token
+        st.session_state["is_exam_only"] = _is_exam_only_user(user)
         _apply_user_preferences(user["id"])
     else:
         _clear_session_cookie()
@@ -489,6 +531,10 @@ def _sync_speed_to_session(session_id: Optional[str]) -> None:
 def initialize_app_state() -> None:
     if "page" not in st.session_state:
         st.session_state["page"] = "login"
+    if "is_exam_only" not in st.session_state:
+        st.session_state["is_exam_only"] = False
+    if "_last_logged_page" not in st.session_state:
+        st.session_state["_last_logged_page"] = None
     if "pbl_log" not in st.session_state:
         st.session_state["pbl_log"] = []
     for key in ["agent_evaluation", "agent_advice", "agent_stats", "discussion_ran"]:
@@ -615,6 +661,7 @@ def _handle_logout() -> None:
             pass
     _clear_session_cookie()
     st.session_state.pop("user", None)
+    st.session_state["is_exam_only"] = False
     st.session_state["speech_speed_level"] = 4
     st.session_state["persisted_speed_level"] = 4
     default_count = _load_default_students_count()
@@ -742,6 +789,38 @@ def start_case(case_id: str) -> None:
     st.session_state["last_force_speak_total"] = 0
 
 
+def _record_exam_only_completion() -> None:
+    if st.session_state.get("session_saved"):
+        return
+    user = st.session_state.get("user")
+    case_id = st.session_state.get("selected_case_id")
+    if not (user and case_id):
+        return
+    started_at = st.session_state.get("session_start") or datetime.now(timezone.utc).isoformat()
+    ended_at = datetime.now(timezone.utc).isoformat()
+    pre_score = st.session_state.get("pre_score") or 0.0
+    post_score = st.session_state.get("post_score") or 0.0
+    evaluation = {"dimensions": {}, "summary": "仅完成前后测，无 PBL 讨论。"}
+    advice = {
+        "general_advice": {"summary": "仅完成前后测，无 PBL 讨论。"},
+        "detailed_advice": [],
+    }
+    try:
+        record_study_session(
+            user_id=user["id"],
+            case_id=case_id,
+            started_at=started_at,
+            ended_at=ended_at,
+            pre_score=pre_score,
+            post_score=post_score,
+            evaluation=evaluation,
+            advice=advice,
+        )
+        st.session_state["session_saved"] = True
+    except Exception as exc:
+        st.warning(f"保存测验记录失败：{exc}")
+
+
 def _fetch_session_state() -> Dict[str, Any] | None:
     session_id = st.session_state.get("pbl_session_id")
     if not session_id:
@@ -797,6 +876,7 @@ def render_login() -> None:
             except Exception as exc:
                 st.warning(f"创建会话失败：{exc}")
             st.session_state["user"] = user
+            st.session_state["is_exam_only"] = _is_exam_only_user(user)
             _apply_user_preferences(user["id"])
             st.session_state["page"] = "case_selection"
             st.success("登录成功！")
@@ -817,9 +897,12 @@ def render_case_selection() -> None:
             st.warning("请先登录。")
             st.session_state["page"] = "login"
             return
+        exam_only = st.session_state.get("is_exam_only", False)
+        if exam_only:
+            st.info("当前账号仅需完成前/后测验，无需进入讨论。选择案例后直接完成测验即可。")
 
         saved_session = st.session_state.get("pending_active_session")
-        if saved_session:
+        if saved_session and not exam_only:
             metadata = saved_session.get("metadata") or {}
             next_idx_raw = metadata.get("next_scene_index", 0)
             try:
@@ -917,6 +1000,18 @@ def render_test_page(kind: str) -> None:
     tests = st.session_state.get(test_key) or default_test_items(kind)
     answers_key = "pre_answers" if kind == "pre" else "post_answers"
     answers = st.session_state.get(answers_key, {})
+    exam_only = st.session_state.get("is_exam_only", False)
+    if kind == "post" and st.session_state.pop("scroll_to_top_on_test", False):
+        components.html(
+            """
+            <script>
+            setTimeout(function() {
+                window.scrollTo({top: 0, left: 0, behavior: 'auto'});
+            }, 150);
+            </script>
+            """,
+            height=0,
+        )
     for idx, item in enumerate(tests, start=1):
         qid = item.get("qid") or f"{kind}_{idx}"
         question_text = item.get("question", f"题目{idx}")
@@ -981,8 +1076,11 @@ def render_test_page(kind: str) -> None:
                     if value not in options:
                         missing.append(idx)
         if missing:
-            st.warning(f"还有 {len(missing)} 道选择题未作答（题号：{', '.join(map(str, missing))}），请补充后再提交。")
-            return
+            if not DEBUG_MODE:
+                st.warning(f"还有 {len(missing)} 道选择题未作答（题号：{', '.join(map(str, missing))}），请补充后再提交。")
+                return
+            else:
+                st.info("调试模式已开启，允许空题提交。")
         score = score_test_items(tests_to_grade, answers)
         if kind == "pre":
             st.session_state["pre_score"] = score
@@ -993,10 +1091,16 @@ def render_test_page(kind: str) -> None:
             st.session_state["pre_question_correctness"] = correctness
             if st.session_state.get("scene_objective_keys"):
                 st.session_state["advanced_scene_mask"] = _compute_scene_advanced_mask(correctness)
-            st.session_state["page"] = "pbl_training"
+            st.session_state["scroll_to_top_on_test"] = True
+            st.session_state["page"] = "post_test" if exam_only else "pbl_training"
         else:
             st.session_state["post_score"] = score
-            st.session_state["page"] = "evaluation"
+            if exam_only:
+                _record_exam_only_completion()
+                reset_case_state()
+                st.session_state["page"] = "case_selection"
+            else:
+                st.session_state["page"] = "evaluation"
         st.rerun()
 
 
@@ -1013,7 +1117,7 @@ def render_survey_page() -> None:
         default_choice = responses.get(qid, SURVEY_CHOICES[2])
         st.markdown(f"**Q{idx}. {question}**")
         choice = st.radio(
-            "",
+            f"Q{idx} 选项",
             SURVEY_CHOICES,
             index=SURVEY_CHOICES.index(default_choice),
             key=f"survey_radio_{idx}",
@@ -1055,6 +1159,12 @@ def _render_pbl_training_inner() -> None:
         st.session_state["page"] = "case_selection"
         st.rerun()
         return
+    if st.session_state.get("is_exam_only"):
+        st.info("当前账号仅需完成测验，PBL 讨论已关闭。")
+        st.session_state["scroll_to_top_on_test"] = True
+        st.session_state["page"] = "post_test" if st.session_state.get("pre_score") is not None else "pre_test"
+        st.rerun()
+        return
     session_id = st.session_state.get("pbl_session_id")
     _sync_speed_to_session(session_id)
     session_state_data = _fetch_session_state()
@@ -1087,6 +1197,7 @@ def _render_pbl_training_inner() -> None:
     can_skip_to_post = bool(session_id) and (
         discussion_ran or max_seen_scene >= max(total_scenes_configured - 1, 0)
     )
+    debug_skip_enabled = DEBUG_MODE
     controls_col, skip_col = st.columns([1, 1], gap="small")
     with controls_col:
         start_disabled = status == "running" or bool(session_id)
@@ -1127,15 +1238,18 @@ def _render_pbl_training_inner() -> None:
                 st.session_state["agent_stats"] = None
                 st.rerun()
     with skip_col:
-        skip_disabled = not can_skip_to_post
+        skip_disabled = not can_skip_to_post and not debug_skip_enabled
         if st.button(
             "结束 PBL 训练，进入后测验",
             key="to_post_test",
             disabled=skip_disabled,
             use_container_width=True,
         ):
+            st.session_state["scroll_to_top_on_test"] = True
             st.session_state["page"] = "post_test"
             st.rerun()
+        if debug_skip_enabled:
+            st.caption("调试模式：允许直接进入后测验。")
 
     if status == "running":
         st.info("学习小组正在协作，请稍候...")
@@ -1196,11 +1310,13 @@ def _render_pbl_training_inner() -> None:
         students_total = _load_default_students_count()
     students_total = max(1, students_total)
     last_forced_total = st.session_state.get("last_force_speak_total", 0)
+    min_gap = max(1, students_total)
     need_force = (
         session_id
         and total_student_messages > (1.5 * students_total)
         and current_seen < (total_student_messages / (1.5 * students_total))
         and not waiting_for_user
+        and (total_student_messages - last_forced_total) >= min_gap
     )
     if need_force and total_student_messages > last_forced_total:
         _trigger_user_turn(session_id, allow_input=True)
@@ -1503,6 +1619,11 @@ def _render_pbl_training_inner() -> None:
 
 
 def render_evaluation_page() -> None:
+    if st.session_state.get("is_exam_only"):
+        st.info("当前账号仅需完成前后测验，已跳过讨论环节。")
+        st.session_state["page"] = "case_selection"
+        st.rerun()
+        return
     case_id = st.session_state.get("selected_case_id")
     if not case_id:
         st.session_state["page"] = "case_selection"
@@ -1714,30 +1835,34 @@ def main() -> None:
         else:
             st.caption("请先登录以体验 PBL 训练。")
         st.markdown("---")
-        _render_speed_slider()
         page_state = st.session_state.get("page", "login")
-        students_locked = (page_state == "pbl_training")
-        current_count = int(st.session_state.get("desired_students_count", 5))
-        new_count = st.slider(
-            "PBL 小组人数",
-            min_value=4,
-            max_value=8,
-            value=current_count,
-            step=1,
-            disabled=students_locked,
-            key="students_count_slider",
-        )
-        if not students_locked and new_count != current_count:
-            st.session_state["desired_students_count"] = new_count
-            user = st.session_state.get("user")
-            if user:
-                if st.session_state.get("persisted_student_count") != new_count:
-                    if _persist_user_preferences(student_count=new_count):
-                        st.session_state["persisted_student_count"] = new_count
-            else:
-                st.session_state["persisted_student_count"] = new_count
-        if students_locked:
-            st.caption("讨论进行中，人数设置暂不可调整。")
+        exam_only_user = st.session_state.get("is_exam_only", False)
+        if exam_only_user:
+            st.info("当前账号仅需完成前后测验，讨论相关设置已禁用。")
+        else:
+            _render_speed_slider()
+            students_locked = (page_state == "pbl_training")
+            current_count = int(st.session_state.get("desired_students_count", 5))
+            new_count = st.slider(
+                "PBL 小组人数",
+                min_value=4,
+                max_value=8,
+                value=current_count,
+                step=1,
+                disabled=students_locked,
+                key="students_count_slider",
+            )
+            if not students_locked and new_count != current_count:
+                st.session_state["desired_students_count"] = new_count
+                user = st.session_state.get("user")
+                if user:
+                    if st.session_state.get("persisted_student_count") != new_count:
+                        if _persist_user_preferences(student_count=new_count):
+                            st.session_state["persisted_student_count"] = new_count
+                else:
+                    st.session_state["persisted_student_count"] = new_count
+            if students_locked:
+                st.caption("讨论进行中，人数设置暂不可调整。")
 
         if user:
             profile_cache = st.session_state.get("user_profile_cache")
@@ -1832,6 +1957,16 @@ def main() -> None:
     if not st.session_state.get("user") and page != "login":
         st.session_state["page"] = "login"
         page = "login"
+
+    # 页面跳转日志，避免重复输出
+    last_logged = st.session_state.get("_last_logged_page")
+    if page != last_logged:
+        user = st.session_state.get("user")
+        try:
+            logger.info("[nav] user=%s page=%s", user.get("username") if user else None, page)
+        except Exception:
+            pass
+        st.session_state["_last_logged_page"] = page
 
     if page != "case_selection":
         _clear_page_container("case_selection_container")

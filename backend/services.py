@@ -49,6 +49,16 @@ def _load_session_timeout_minutes() -> float:
         return 30.0
 
 
+def _load_exam_only_users() -> set[str]:
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        raw = cfg.get("exam_only_users") or []
+        return {str(u).strip().lower() for u in raw if str(u).strip()}
+    except Exception:
+        return set()
+
+
 @dataclass
 class CaseBrief:
     case_id: str
@@ -321,12 +331,16 @@ class PBLInteractiveSession:
             self.prompts_snapshot = result.get("prompts")
             if self.evaluation is not None:
                 logger.info(
-                    "[PBL] EvaluationAgent output:\n%s",
+                    "[PBL] user=%s case=%s EvaluationAgent output:\n%s",
+                    self.owner_username or self.owner_user_id or "unknown",
+                    self.case_id,
                     json.dumps(self.evaluation, ensure_ascii=False, indent=2),
                 )
             if self.advice is not None:
                 logger.info(
-                    "[PBL] AdvisorAgent output:\n%s",
+                    "[PBL] user=%s case=%s AdvisorAgent output:\n%s",
+                    self.owner_username or self.owner_user_id or "unknown",
+                    self.case_id,
                     json.dumps(self.advice, ensure_ascii=False, indent=2),
                 )
             self.status = "completed"
@@ -367,7 +381,9 @@ class PBLInteractiveSession:
             self.advice = advice
         if advice is not None:
             logger.info(
-                "[PBL] AdvisorAgent (with tests) output:\n%s",
+                "[PBL] user=%s case=%s AdvisorAgent (with tests) output:\n%s",
+                self.owner_username or self.owner_user_id or "unknown",
+                self.case_id,
                 json.dumps(advice, ensure_ascii=False, indent=2),
             )
         self.touch()
@@ -401,8 +417,10 @@ class PBLInteractiveSession:
                 self.freeze_log_index = None
             log_len = len(self.log)
         logger.info(
-            "[hook %s] speaker=%s drop=%s len_before=%s freeze=%s suppress=%s",
+            "[hook %s] owner=%s case=%s speaker=%s drop=%s len_before=%s freeze=%s suppress=%s",
             time.strftime('%H:%M:%S'),
+            self.owner_username or self.owner_user_id or "unknown",
+            self.case_id,
             speaker,
             drop,
             log_len,
@@ -652,6 +670,7 @@ _SESSION_MANAGER = PBLSessionManager(
     pause_interval=_load_pause_interval(),
     session_timeout_minutes=_load_session_timeout_minutes(),
 )
+EXAM_ONLY_USERS = _load_exam_only_users()
 
 
 def run_agent_workflow(case_id: str, cfg_overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -673,6 +692,9 @@ def start_interactive_session(
     prefill_log: List[Dict[str, Any]] | None = None,
     prefill_stats: Dict[str, Any] | None = None,
 ) -> str:
+    username = (owner_username or "").strip().lower()
+    if username and username in EXAM_ONLY_USERS:
+        raise PermissionError("exam-only users are not allowed to start PBL sessions")
     return _SESSION_MANAGER.create_session(
         case_id,
         speed_factor=speed_factor,

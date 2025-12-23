@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -16,6 +17,8 @@ DEFAULT_COMPOSITE_WEIGHTS = {
     "post": 1.0,
     "dimension": 0.25,
 }
+
+logger = logging.getLogger("pbl.backend")
 
 
 def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
@@ -298,6 +301,17 @@ def record_study_session(
     )
     conn.commit()
     conn.close()
+    try:
+        logger.info(
+            "[study_session] user_id=%s case=%s pre=%.2f post=%.2f composite=%s",
+            user_id,
+            case_id,
+            float(pre_score),
+            float(post_score),
+            composite,
+        )
+    except Exception:
+        pass
 
 
 def record_feedback(user_id: int, content: str, created_at: Optional[str] = None) -> None:
@@ -313,6 +327,10 @@ def record_feedback(user_id: int, content: str, created_at: Optional[str] = None
     )
     conn.commit()
     conn.close()
+    try:
+        logger.info("[feedback] user_id=%s length=%s", user_id, len(content or ""))
+    except Exception:
+        pass
 
 
 def record_survey_response(
@@ -338,6 +356,16 @@ def record_survey_response(
     )
     conn.commit()
     conn.close()
+    try:
+        logger.info(
+            "[survey] user_id=%s case=%s answers_count=%s payload=%s",
+            user_id,
+            case_id,
+            len(answers or {}),
+            json.dumps(answers or {}, ensure_ascii=False),
+        )
+    except Exception:
+        pass
 
 
 def get_user_settings(user_id: int) -> Optional[Dict[str, Optional[int]]]:
