@@ -99,6 +99,9 @@ SURVEY_QUESTIONS = [
     "在该系统中完成我的角色任务需要投入较大脑力负荷。",
     "在讨论过程中，我经常感到信息量过大或步骤过于复杂。",
     "系统界面/提示/虚拟学生的互动让我分心，影响我聚焦病例关键线索。",
+    "系统推荐的 PBL 案例贴合我当前的学习需要。",
+    "测试题目内容合理，能有效评估我对案例的理解。",
+    "系统对我表现的评估准确，并提供了明确的改进建议。",
 ]
 
 SURVEY_CHOICES = ["非常同意", "比较同意", "不确定", "比较不同意", "非常不同意"]
@@ -782,7 +785,7 @@ def start_case(case_id: str) -> None:
     st.session_state["manual_pause_active"] = False
     st.session_state["summary_invite_scene"] = -1
     st.session_state["advice_enhanced"] = False
-    st.session_state["page"] = "pre_test"
+    st.session_state["page"] = "exam_test" if st.session_state.get("is_exam_only") else "pre_test"
     st.session_state["scene_objective_keys"] = case_service.scene_objective_layout(case_id)
     st.session_state["advanced_scene_mask"] = None
     st.session_state["pre_question_correctness"] = []
@@ -991,6 +994,11 @@ def render_case_selection() -> None:
 
 
 def render_test_page(kind: str) -> None:
+    # 仅测用户统一走 exam_test 页面
+    if st.session_state.get("is_exam_only"):
+        st.session_state["page"] = "exam_test"
+        st.rerun()
+        return
     brief = st.session_state.get("case_brief")
     if not brief:
         st.session_state["page"] = "case_selection"
@@ -1108,7 +1116,112 @@ def render_test_page(kind: str) -> None:
                         st.session_state["session_saved"] = True
                     except Exception as exc:
                         logger.warning("后测分数上报失败：%s", exc)
-                st.session_state["page"] = "evaluation"
+            st.session_state["page"] = "evaluation"
+        st.rerun()
+
+
+def _render_exam_only_section(kind: str, tests: List[Dict[str, Any]], answers: Dict[str, Any]) -> Dict[str, Any]:
+    st.subheader("前测" if kind == "pre" else "后测")
+    for idx, item in enumerate(tests, start=1):
+        qid = item.get("qid") or f"{kind}_{idx}"
+        question_text = item.get("question", f"题目{idx}")
+        st.markdown(f"**题目{idx}：{question_text}**")
+        st.caption(f"{item.get('question_type', '题型未知')} | {item.get('exam_subject', '')}")
+        options = item.get("option")
+        question_type = str(item.get("question_type", "")).lower()
+        is_multi = "多" in question_type
+        if isinstance(options, dict) and options:
+            option_keys = list(options.keys())
+            format_func = lambda opt: f"{opt}. {options[opt]}"
+            if is_multi:
+                existing = answers.get(qid, [])
+                selected_set = set(existing if isinstance(existing, list) else [])
+                new_selected: List[str] = []
+                for opt in option_keys:
+                    checked = st.checkbox(
+                        format_func(opt),
+                        value=opt in selected_set,
+                        key=f"{qid}_{opt}_checkbox_exam",
+                    )
+                    if checked:
+                        new_selected.append(opt)
+                answers[qid] = new_selected
+            else:
+                default_val = answers.get(qid)
+                option_entries = ["未选择"] + option_keys
+                if default_val in option_keys:
+                    default_entry = option_entries.index(default_val)
+                else:
+                    default_entry = 0
+                selection = st.radio(
+                    f"选择题目{idx}",
+                    option_entries,
+                    index=default_entry,
+                    format_func=lambda opt: format_func(opt) if opt in option_keys else opt,
+                    key=f"{qid}_radio_exam",
+                )
+                answers[qid] = selection if selection in option_keys else ""
+        else:
+            response = st.text_input(
+                f"你的答案（题目{idx}）",
+                value=answers.get(qid, ""),
+                key=f"{qid}_response_exam",
+            )
+            answers[qid] = response
+    return answers
+
+
+def render_exam_only_tests() -> None:
+    """仅测账号：单页完成前后测。"""
+    pre_tests = st.session_state.get("pre_test_items") or default_test_items("pre")
+    post_tests = st.session_state.get("post_test_items") or default_test_items("post")
+    pre_answers = st.session_state.get("pre_answers", {})
+    post_answers = st.session_state.get("post_answers", {})
+    st.title("测验")
+    st.info("仅需完成前测与后测，提交后系统自动记录成绩。")
+
+    pre_answers = _render_exam_only_section("pre", pre_tests, pre_answers)
+    st.divider()
+    post_answers = _render_exam_only_section("post", post_tests, post_answers)
+
+    st.session_state["pre_answers"] = pre_answers
+    st.session_state["post_answers"] = post_answers
+
+    if st.button("提交全部测验", key="submit_exam_only", use_container_width=True):
+        # 校验必答
+        def _missing(tests: List[Dict[str, Any]], answers: Dict[str, Any]) -> List[int]:
+            missing_idx = []
+            for idx, item in enumerate(tests, start=1):
+                qid = item.get("qid") or f"pre_{idx}"
+                options = item.get("option")
+                question_type = str(item.get("question_type", "")).lower()
+                is_multi = isinstance(options, dict) and "多" in question_type
+                if isinstance(options, dict) and options:
+                    value = answers.get(qid)
+                    if is_multi:
+                        if not value or not isinstance(value, list) or not [opt for opt in value if opt in options]:
+                            missing_idx.append(idx)
+                    else:
+                        if value not in options:
+                            missing_idx.append(idx)
+            return missing_idx
+
+        missing_pre = _missing(pre_tests, pre_answers)
+        missing_post = _missing(post_tests, post_answers)
+        if (missing_pre or missing_post) and not DEBUG_MODE:
+            st.warning(
+                f"前测缺少 {len(missing_pre)} 题，后测缺少 {len(missing_post)} 题，请补充后再提交。"
+            )
+            return
+
+        pre_score = score_test_items(pre_tests, pre_answers)
+        post_score = score_test_items(post_tests, post_answers)
+        st.session_state["pre_score"] = pre_score
+        st.session_state["post_score"] = post_score
+        _record_exam_only_completion()
+        reset_case_state()
+        st.success("已提交并记录成绩，返回案例选择。")
+        st.session_state["page"] = "case_selection"
         st.rerun()
 
 
@@ -1991,6 +2104,8 @@ def main() -> None:
         render_pbl_training()
     elif page == "post_test":
         render_test_page("post")
+    elif page == "exam_test":
+        render_exam_only_tests()
     elif page == "survey":
         render_survey_page()
     elif page == "evaluation":
