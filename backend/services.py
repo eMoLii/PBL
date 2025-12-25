@@ -50,6 +50,15 @@ def _load_session_timeout_minutes() -> float:
         return 30.0
 
 
+def _load_cleanup_grace_minutes() -> float:
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return float(cfg.get("session_cleanup_grace_minutes", 5.0))
+    except Exception:
+        return 5.0
+
+
 def _load_exam_only_users() -> set[str]:
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as f:
@@ -408,6 +417,10 @@ class PBLInteractiveSession:
             self.post_score = float(post_score)
         self._persist_if_ready()
 
+    def ensure_persisted(self) -> None:
+        """外部调用，尝试落库（用于清理前的兜底）。"""
+        self._persist_if_ready()
+
     def _persist_if_ready(self) -> None:
         """在评估/建议和分数齐备时写入学习记录，防止前端中途关闭导致漏写。"""
         if self.persisted:
@@ -564,12 +577,13 @@ class PBLInteractiveSession:
 
 
 class PBLSessionManager:
-    def __init__(self, pause_interval: float = 12.0, session_timeout_minutes: float = 30.0):
+    def __init__(self, pause_interval: float = 12.0, session_timeout_minutes: float = 30.0, cleanup_grace_minutes: float = 5.0):
         self.sessions: Dict[str, PBLInteractiveSession] = {}
         self.lock = threading.Lock()
         self.pause_interval = pause_interval
         self.session_timeout = max(60.0, float(session_timeout_minutes) * 60.0)
         self.completed_retention = max(self.session_timeout, 300.0)
+        self.cleanup_grace = max(0.0, float(cleanup_grace_minutes) * 60.0)
         self._stop_cleaner = threading.Event()
         self._cleaner_thread = threading.Thread(target=self._cleaner_loop, daemon=True)
         self._cleaner_thread.start()
@@ -587,6 +601,11 @@ class PBLSessionManager:
         with self.lock:
             removed: List[tuple[str, PBLInteractiveSession]] = []
             for sid, session in list(self.sessions.items()):
+                # 清理前先尝试落库，避免评估已完成但会话被过早回收
+                try:
+                    session.ensure_persisted()
+                except Exception as exc:
+                    logger.warning("[SessionManager] Persist attempt failed for %s: %s", sid, exc)
                 expired = session.is_expired(now, self.session_timeout)
                 finished = session.is_finished()
                 remove = False
@@ -600,7 +619,8 @@ class PBLSessionManager:
                     remove = True
                 elif finished:
                     completed_at = session.completed_at or now
-                    if (now - completed_at) >= self.completed_retention:
+                    # 完成会话保留 cleanup_grace 时间，优先等待前端/落库完成
+                    if (now - completed_at) >= max(self.cleanup_grace, self.completed_retention):
                         remove = True
                 if remove:
                     removed.append((sid, session))
@@ -621,9 +641,10 @@ class PBLSessionManager:
                     session.prefill_stats.clear()
                     session.queue = queue.Queue()
                 logger.info(
-                    "[SessionManager] Cleaned %d session(s): %s. Remaining: %s",
+                    "[SessionManager] Cleaned %d session(s): %s at %s. Remaining: %s",
                     len(removed),
                     detail_bits,
+                    datetime.now(timezone.utc).isoformat(),
                     remaining_info,
                 )
                 gc.collect()
@@ -714,6 +735,16 @@ class PBLSessionManager:
         session = self.sessions.get(session_id)
         if not session:
             raise KeyError("session not found")
+        try:
+            logger.info(
+                "[Session] %s pre_score=%.2f post_score=%.2f received at %s",
+                session_id,
+                pre_score,
+                post_score,
+                datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception:
+            pass
         session.finalize_scores(pre_score, post_score)
 
 
@@ -729,6 +760,7 @@ def _load_pause_interval() -> float:
 _SESSION_MANAGER = PBLSessionManager(
     pause_interval=_load_pause_interval(),
     session_timeout_minutes=_load_session_timeout_minutes(),
+    cleanup_grace_minutes=_load_cleanup_grace_minutes(),
 )
 EXAM_ONLY_USERS = _load_exam_only_users()
 
