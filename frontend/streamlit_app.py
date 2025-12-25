@@ -21,7 +21,11 @@ CONFIG_PATH = REPO_ROOT / "agent_collaboration" / "config.json"
 
 logger = logging.getLogger("pbl.frontend")
 if not logging.getLogger().handlers:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 from backend.database import (  # noqa: E402
     fetch_user_history,
@@ -1067,7 +1071,7 @@ def render_test_page(kind: str) -> None:
                 key=f"{qid}_response",
             )
             answers[qid] = response
-    st.session_state[answers_key] = answers
+        st.session_state[answers_key] = answers
     if st.button("提交测验", key=f"submit_{kind}_test"):
         tests_to_grade = st.session_state.get(test_key) or []
         missing = []
@@ -1093,6 +1097,10 @@ def render_test_page(kind: str) -> None:
         score = score_test_items(tests_to_grade, answers)
         if kind == "pre":
             st.session_state["pre_score"] = score
+            try:
+                logger.info("pre_test submitted: user=%s case=%s score=%.2f", (st.session_state.get("user") or {}).get("username"), st.session_state.get("selected_case_id"), score)
+            except Exception:
+                pass
             correctness = [
                 _evaluate_question_correct(item, answers.get(item.get("qid") or f"{kind}_{idx}"))
                 for idx, item in enumerate(tests_to_grade, start=1)
@@ -1104,6 +1112,10 @@ def render_test_page(kind: str) -> None:
             st.session_state["page"] = "post_test" if exam_only else "pbl_training"
         else:
             st.session_state["post_score"] = score
+            try:
+                logger.info("post_test submitted: user=%s case=%s pre=%.2f post=%.2f", (st.session_state.get("user") or {}).get("username"), st.session_state.get("selected_case_id"), float(st.session_state.get("pre_score") or 0.0), score)
+            except Exception:
+                pass
             if exam_only:
                 _record_exam_only_completion()
                 reset_case_state()

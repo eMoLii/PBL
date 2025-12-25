@@ -31,7 +31,11 @@ from backend.database import (
 
 logger = logging.getLogger("pbl.backend")
 if not logging.getLogger().handlers:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 # Suppress verbose HTTP client logs (e.g., httpx request lines).
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
